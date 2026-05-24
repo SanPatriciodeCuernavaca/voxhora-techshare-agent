@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import pickle
-import re
 from pathlib import Path
 from typing import Any
 
@@ -97,52 +96,85 @@ class TechShareSession:
 
     # ----- login flow -----
 
-    _ANTIFORGERY_INPUT_RE = re.compile(
-        r'name="__RequestVerificationToken"[^>]*value="([^"]+)"',
-        re.IGNORECASE,
-    )
-
     def login(self) -> None:
-        """Programmatic ASP.NET MVC form login.
+        """Programmatic login against TechShare's Ember.js login endpoint.
 
-        Note: not yet end-to-end verified against TechShare in this codebase.
-        The recon session 2026-05-25 had Patrick log in manually; the
-        cookies were inherited from his browser. This method covers the
-        steady-state agent re-login case. If the actual form has additional
-        fields (MFA, redirect targets, etc.), this raises and the caller
-        falls back to manual cookie-import.
+        Discovered from /App/controllers/login.js + /App/routes/login.js
+        (2026-05-25 recon, source-reading):
+
+          POST /api/auth
+          Content-Type: application/x-www-form-urlencoded
+          Body: username=<un>&password=<pw>&errorMessage=&isResource=
+
+        On success the server sets an HttpOnly session cookie and returns
+        JSON with three remediation flags:
+
+          { pwIsExpired: bool, needsConfirmation: bool, requiresMfa: bool }
+
+        If any flag is true the user would normally be routed to a
+        remediation flow in the browser; here we raise a TechShareAuthError
+        with a clear message so the operator can resolve manually before
+        retrying.
         """
         techshare_user, techshare_pass = self._retrieve_credentials()
 
-        # Step 1: GET the login page to extract __RequestVerificationToken
-        login_url = f"{config.TECHSHARE_BASE_URL}/Account/LogOn"
-        resp = self._session.get(login_url, allow_redirects=True)
-        if resp.status_code != 200:
-            raise TechShareAuthError(f"GET {login_url} returned {resp.status_code}")
-
-        match = self._ANTIFORGERY_INPUT_RE.search(resp.text)
-        if not match:
-            raise TechShareAuthError(
-                "Could not find __RequestVerificationToken in login page; "
-                "TechShare's login form structure may have changed."
-            )
-        antiforgery = match.group(1)
-
-        # Step 2: POST credentials + token
+        auth_url = f"{config.TECHSHARE_BASE_URL}/api/auth"
         form = {
-            "__RequestVerificationToken": antiforgery,
-            "Username": techshare_user,
-            "Password": techshare_pass,
+            "username": techshare_user,
+            "password": techshare_pass,
+            "errorMessage": "",
+            "isResource": "",
         }
-        resp = self._session.post(login_url, data=form, allow_redirects=True)
-        if resp.status_code >= 400:
-            raise TechShareAuthError(f"POST {login_url} returned {resp.status_code}")
+        # jQuery $.post default — form-encoded, NOT JSON
+        resp = self._session.post(
+            auth_url,
+            data=form,
+            headers={"Accept": "application/json"},
+            allow_redirects=False,
+            timeout=30,
+        )
 
-        # Step 3: verify we're authenticated by hitting /api/csrf-token
+        if resp.status_code == 400:
+            # The login controller highlights validation errors on 400
+            raise TechShareAuthError(
+                f"Login rejected by server (400): {resp.text[:300]}. "
+                f"Likely bad username or password."
+            )
+        if resp.status_code >= 400:
+            raise TechShareAuthError(
+                f"POST /api/auth returned {resp.status_code}: {resp.text[:300]}"
+            )
+
+        # Successful POST returns JSON with remediation flags
+        try:
+            payload = resp.json()
+        except Exception as e:
+            raise TechShareAuthError(
+                f"Login response was not JSON ({e}); body: {resp.text[:300]}"
+            )
+
+        if payload.get("requiresMfa"):
+            raise TechShareAuthError(
+                "Account requires MFA (multi-factor auth). Agent v1 does "
+                "not handle MFA flows yet. Resolve via the browser, then "
+                "retry agent login."
+            )
+        if payload.get("pwIsExpired"):
+            raise TechShareAuthError(
+                "TechShare password is expired. Reset it via the browser, "
+                "update via `voxhora-techshare-agent login`."
+            )
+        if payload.get("needsConfirmation"):
+            raise TechShareAuthError(
+                "Account needs confirmation (likely first-login or contact-"
+                "info verification). Complete via the browser, then retry."
+            )
+
+        # Refresh CSRF token after login (mirrors the controller's success handler)
         if not self._fetch_csrf_token():
             raise TechShareAuthError(
-                "Login appeared to succeed but /api/csrf-token failed. "
-                "Possible MFA challenge or password expired."
+                "Login HTTP succeeded but /api/csrf-token failed afterwards. "
+                "Session may not be valid."
             )
 
         self._save_cookies()
