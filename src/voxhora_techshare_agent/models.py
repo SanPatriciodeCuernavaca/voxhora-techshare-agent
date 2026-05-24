@@ -43,7 +43,8 @@ class CaseDetail:
     def from_collection_json(cls, payload: dict[str, Any]) -> CaseDetail:
         item = payload["collection"]["items"][0]
         data = {f["name"]: f.get("value") for f in item.get("data", [])}
-        links = {l["rel"]: l["href"] for l in item.get("links", [])}
+        # Collection+JSON allows links without href (action stubs). Filter them out.
+        links = {l["rel"]: l["href"] for l in item.get("links", []) if l.get("rel") and l.get("href")}
         return cls(
             case_id=data.get("case-id"),
             case_number=data.get("case-number", ""),
@@ -87,7 +88,8 @@ class DMEItem:
     @classmethod
     def from_item(cls, item: dict[str, Any]) -> DMEItem:
         data = {f["name"]: f.get("value") for f in item.get("data", [])}
-        links = {l["rel"]: l["href"] for l in item.get("links", [])}
+        # Collection+JSON allows links without href (action stubs). Filter them out.
+        links = {l["rel"]: l["href"] for l in item.get("links", []) if l.get("rel") and l.get("href")}
         return cls(
             name=data.get("name", ""),
             type=data.get("type", ""),
