@@ -56,6 +56,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     bf.add_argument("--to", dest="to_date", default=None, help="ISO date (default: today)")
     bf.add_argument("--rate-limit", default="max", help="'max' or e.g. '1/sec'")
 
+    rf = sub.add_parser("refresh", help="Light refresh for ONE case — pulls PC affidavit + plea offer only (no videos/audio/other DME). Use this for steady-state agent flows.")
+    rf.add_argument("cause_number", help="e.g. C1CR26203830 or D1DC23207931")
+
+    ba = sub.add_parser("backfill-all", help="Light refresh for ALL cases in the cause→UUID cache (PC + plea per case). Use after seeding the cache to populate every existing client.")
+    ba.add_argument("--rate-limit-seconds", type=float, default=0.0, help="Seconds to sleep between cases (default 0). Use e.g. 1.0 to spread audit footprint over time.")
+    ba.add_argument("--limit", type=int, default=0, help="Stop after this many cases (0 = no limit).")
+
     args = parser.parse_args(argv)
 
     dispatch = {
@@ -64,6 +71,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "process-email": cmd_process_email,
         "fetch": cmd_fetch,
         "backfill": cmd_backfill,
+        "refresh": cmd_refresh,
+        "backfill-all": cmd_backfill_all,
     }
     try:
         return dispatch[args.command](args)
@@ -233,6 +242,133 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     storage.save_seen_dme_ids(seen)
     print(f"OK — {cause_number}: {new_downloads} new files downloaded ({len(dme_items)} total in case)")
     return 0
+
+
+def _refresh_one_case(cause_number: str, client: TechShareClient) -> dict:
+    """Internal: light refresh of one case — PC affidavit + plea offer only.
+
+    Returns {"cause": ..., "pcs_downloaded": int, "plea_captured": bool, "skipped": bool, "error": str|None}
+    Does NOT download videos, audio, or other discovery — that's reserved
+    for the explicit `fetch` subcommand (invoked via Voxhora-Mac's
+    "Download Remaining Discovery" button).
+    """
+    result = {"cause": cause_number, "pcs_downloaded": 0, "plea_captured": False, "skipped": False, "error": None}
+    resolved = _resolve_case(cause_number)
+    if not resolved:
+        result["error"] = "not in cache"
+        return result
+    service_id = resolved["service_id"]
+    case_uuid = resolved["case_uuid"]
+
+    try:
+        case = client.get_case_detail(service_id, case_uuid)
+    except Exception as e:
+        result["error"] = f"case-detail failed: {e}"
+        return result
+
+    # PC affidavit only
+    try:
+        dme_items = client.get_dme_list(service_id, case)
+    except Exception as e:
+        result["error"] = f"dme-list failed: {e}"
+        return result
+
+    pcs = client.pc_affidavits_in(dme_items)
+    seen = storage.load_seen_dme_ids()
+    for pc in pcs:
+        fp = storage.dme_fingerprint(pc)
+        if fp in seen:
+            continue
+        try:
+            data = client.download_dme_file(service_id, pc)
+            storage.write_pc_affidavit(pc, data, cause_number)
+            seen.add(fp)
+            result["pcs_downloaded"] += 1
+        except Exception as e:
+            result["error"] = f"PC download failed: {e}"
+            break
+    storage.save_seen_dme_ids(seen)
+
+    # Plea offer (only if the link is present on the case)
+    try:
+        plea = client.get_plea_offer(service_id, case)
+        if plea:
+            storage.write_plea_offer(plea, cause_number)
+            result["plea_captured"] = True
+    except Exception as e:
+        # Don't fail the whole refresh on a plea read error
+        log.warning("plea fetch failed for %s: %s", cause_number, e)
+
+    return result
+
+
+def cmd_refresh(args: argparse.Namespace) -> int:
+    session = TechShareSession()
+    session.ensure_authenticated()
+    client = TechShareClient(session)
+    r = _refresh_one_case(args.cause_number, client)
+    storage.record_run_result(
+        mode="refresh",
+        cause_number=args.cause_number,
+        pcs_downloaded=r["pcs_downloaded"],
+        plea_captured=r["plea_captured"],
+        error=r["error"],
+    )
+    if r["error"]:
+        print(f"ERROR {args.cause_number}: {r['error']}", file=sys.stderr)
+        return 1
+    print(f"OK {args.cause_number} — PCs +{r['pcs_downloaded']}, plea {'captured' if r['plea_captured'] else 'none'}")
+    return 0
+
+
+def cmd_backfill_all(args: argparse.Namespace) -> int:
+    """Iterate every case in the cause→UUID cache and run a light refresh.
+
+    Light = PC affidavit + plea offer only. No videos/audio/other DME —
+    that's reserved for the per-case `fetch` subcommand invoked via the
+    Voxhora-Mac case-view "Download Remaining Discovery" button.
+    """
+    import time
+    cache = storage.load_case_cache()
+    if not cache:
+        print("ERROR: case-uuid cache empty. Seed via Chrome MCP scrape "
+              "(see Voxhora handoff doc 2026-05-25) before running backfill-all.",
+              file=sys.stderr)
+        return 1
+
+    causes = sorted(cache.keys())
+    if args.limit > 0:
+        causes = causes[: args.limit]
+
+    session = TechShareSession()
+    session.ensure_authenticated()
+    client = TechShareClient(session)
+
+    totals = {"cases": 0, "pcs": 0, "pleas": 0, "errors": 0}
+    print(f"backfill-all: {len(causes)} cases (rate-limit {args.rate_limit_seconds}s between cases)")
+    for i, cause in enumerate(causes, 1):
+        r = _refresh_one_case(cause, client)
+        totals["cases"] += 1
+        totals["pcs"] += r["pcs_downloaded"]
+        if r["plea_captured"]:
+            totals["pleas"] += 1
+        if r["error"]:
+            totals["errors"] += 1
+            print(f"  [{i}/{len(causes)}] {cause}: ERROR {r['error']}", file=sys.stderr)
+        else:
+            print(f"  [{i}/{len(causes)}] {cause}: PCs +{r['pcs_downloaded']}, plea {'Y' if r['plea_captured'] else '-'}")
+        storage.record_run_result(
+            mode="backfill-all",
+            cause_number=cause,
+            pcs_downloaded=r["pcs_downloaded"],
+            plea_captured=r["plea_captured"],
+            error=r["error"],
+        )
+        if args.rate_limit_seconds > 0 and i < len(causes):
+            time.sleep(args.rate_limit_seconds)
+
+    print(f"\nDONE — {totals['cases']} cases, {totals['pcs']} new PCs, {totals['pleas']} pleas captured, {totals['errors']} errors")
+    return 0 if totals["errors"] == 0 else 2
 
 
 def cmd_backfill(args: argparse.Namespace) -> int:
