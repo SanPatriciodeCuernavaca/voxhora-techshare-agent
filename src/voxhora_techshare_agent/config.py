@@ -44,6 +44,16 @@ def last_run_path(username: str | None = None) -> Path:
     return state_dir(username) / "last_run.json"
 
 
+def case_uuid_cache_path(username: str | None = None) -> Path:
+    """Cause-number → {case_uuid, service_id, backend_port} map.
+
+    Seeded by a one-time scrape of /Ember/Cases (see Voxhora handoff doc
+    2026-05-25 for the seed methodology). Future: agent self-refreshes via
+    an authenticated HTTP scrape of the same endpoint.
+    """
+    return state_dir(username) / "case_uuid_cache.json"
+
+
 def log_dir(username: str | None = None) -> Path:
     base = Path.home() / "Library" / "Logs" / "voxhora-techshare-agent" / (username or getpass.getuser())
     base.mkdir(parents=True, exist_ok=True)

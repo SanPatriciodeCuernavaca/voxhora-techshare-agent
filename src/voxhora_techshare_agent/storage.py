@@ -139,6 +139,38 @@ def write_plea_offer(plea: PleaOffer, cause_number: str) -> Path:
 # ----- last-run bookkeeping -----
 
 
+def load_case_cache(username: str | None = None) -> dict[str, dict]:
+    """Load the cause-number → {case_uuid, service_id, backend_port} map.
+
+    Returns {} if the cache doesn't exist yet (caller should surface a
+    helpful error directing the user to seed via the scrape script).
+    """
+    path = config.case_uuid_cache_path(username)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception as e:
+        log.error("case-uuid cache corrupt (%s); returning empty", e)
+        return {}
+
+
+def lookup_case(cause_number: str, username: str | None = None) -> dict | None:
+    """Look up a case in the cache. Returns None if not present."""
+    return load_case_cache(username).get(cause_number)
+
+
+def case_cache_stats(username: str | None = None) -> dict:
+    """Counts by backend port (useful for cli status output)."""
+    cache = load_case_cache(username)
+    by_port: dict[int, int] = {}
+    for entry in cache.values():
+        port = entry.get("backend_port")
+        if port is not None:
+            by_port[port] = by_port.get(port, 0) + 1
+    return {"total": len(cache), "by_port": by_port}
+
+
 def record_run_result(
     *,
     mode: str,

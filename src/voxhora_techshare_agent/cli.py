@@ -48,8 +48,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     fc = sub.add_parser("fetch", help="On-demand bulk DME pull for one case (videos + all DME).")
     fc.add_argument("cause_number", help="e.g. C1CR26203830 or D1DC23207931")
-    fc.add_argument("--service-id", default=None, help="Service UUID (default: auto-detect from cause prefix)")
-    fc.add_argument("--case-uuid", required=True, help="TechShare case UUID")
+    fc.add_argument("--service-id", default=None, help="Service UUID override (default: from case cache)")
+    fc.add_argument("--case-uuid", default=None, help="Case UUID override (default: from case cache)")
 
     bf = sub.add_parser("backfill", help="One-time scan over a date range (stub in v1).")
     bf.add_argument("--from", dest="from_date", required=True, help="ISO date e.g. 2026-01-01")
@@ -98,12 +98,18 @@ def cmd_login(_args: argparse.Namespace) -> int:
 def cmd_status(_args: argparse.Namespace) -> int:
     session = TechShareSession()
     authed = session.is_authenticated()
+    cache_stats = storage.case_cache_stats()
     print(f"Session authenticated: {authed}")
-    print(f"State dir:            {config.state_dir()}")
-    print(f"Cookies file:         {config.cookies_path()}")
-    print(f"Seen DME cache:       {config.seen_dme_path()}")
-    print(f"Bulk inbox:           {config.dropbox_inbox()}")
-    print(f"Last-run log:         {config.last_run_path()}")
+    print(f"State dir:             {config.state_dir()}")
+    print(f"Cookies file:          {config.cookies_path()}")
+    print(f"Seen DME cache:        {config.seen_dme_path()}")
+    print(f"Case UUID cache:       {config.case_uuid_cache_path()}")
+    print(f"  total cases:         {cache_stats['total']}")
+    for port, n in sorted(cache_stats["by_port"].items()):
+        scope = "Travis CA" if port == 1030 else ("Travis DA" if port == 1031 else f"port {port}")
+        print(f"  {scope} (port {port}): {n}")
+    print(f"Bulk inbox:            {config.dropbox_inbox()}")
+    print(f"Last-run log:          {config.last_run_path()}")
     return 0 if authed else 3
 
 
@@ -129,24 +135,18 @@ def cmd_process_email(args: argparse.Namespace) -> int:
     session.ensure_authenticated()
     client = TechShareClient(session)
 
-    service_id = _service_id_for_cause(event.cause_number)
-
-    # Backfill mode + steady-state both work the same here: caller of
-    # process-email is responsible for the case-UUID lookup. For v1 we need
-    # to call search_cases() — which is currently NotImplementedError. The
-    # email-driven flow assumes the MailInboxWatcher side (Voxhora-Mac) has
-    # already cross-referenced cause-number → case-UUID via Voxhora's local
-    # SwiftData store and passes it in via an env var.
-    case_uuid = _resolve_case_uuid(event.cause_number)
-    if not case_uuid:
+    resolved = _resolve_case(event.cause_number)
+    if not resolved:
         log.error(
-            "Cannot resolve case UUID for cause %s. v1 expects the caller "
-            "to pre-resolve via Voxhora's SwiftData store and pass via env "
-            "var VOXHORA_TECHSHARE_CASE_UUID. (search_cases not yet "
-            "implemented; tracked as follow-up.)",
+            "Cannot resolve case %s — not in cause→UUID cache. Run "
+            "`voxhora-techshare-agent refresh-cases` after logging in to "
+            "TechShare, or pass VOXHORA_TECHSHARE_CASE_UUID + "
+            "VOXHORA_TECHSHARE_SERVICE_ID env vars.",
             event.cause_number,
         )
         return 4
+    service_id = resolved["service_id"]
+    case_uuid = resolved["case_uuid"]
 
     case = client.get_case_detail(service_id, case_uuid)
     log.info("case loaded: %s defendant=%s status=%s", case.case_number, case.defendant_name, case.status)
@@ -191,8 +191,18 @@ def cmd_process_email(args: argparse.Namespace) -> int:
 
 def cmd_fetch(args: argparse.Namespace) -> int:
     cause_number = args.cause_number
-    service_id = args.service_id or _service_id_for_cause(cause_number)
-    case_uuid = args.case_uuid
+
+    # Resolve from cache unless overridden on CLI
+    resolved = _resolve_case(cause_number) or {}
+    service_id = args.service_id or resolved.get("service_id")
+    case_uuid = args.case_uuid or resolved.get("case_uuid")
+    if not service_id or not case_uuid:
+        log.error(
+            "Cannot resolve %s — not in cause→UUID cache, and --service-id / "
+            "--case-uuid not provided.",
+            cause_number,
+        )
+        return 4
 
     session = TechShareSession()
     session.ensure_authenticated()
@@ -239,28 +249,27 @@ def cmd_backfill(args: argparse.Namespace) -> int:
 # ----- helpers -----
 
 
-def _service_id_for_cause(cause_number: str) -> str:
-    """Map cause-number prefix to the right Travis County service scope."""
-    if cause_number.startswith("C1CR"):
-        return config.SERVICE_TRAVIS_COUNTY_ATTORNEY
-    if cause_number.startswith("D1DC"):
-        return config.SERVICE_TRAVIS_DISTRICT_ATTORNEY
-    raise ValueError(
-        f"Cannot infer service scope from cause number {cause_number!r}; "
-        f"pass --service-id explicitly."
-    )
+def _resolve_case(cause_number: str) -> dict | None:
+    """Resolve a cause-number to its TechShare routing info.
 
+    Fallback chain:
+      1. Env vars VOXHORA_TECHSHARE_CASE_UUID + VOXHORA_TECHSHARE_SERVICE_ID
+         (manual overrides for testing or single-shot calls)
+      2. case_uuid_cache.json — populated by the periodic scrape of
+         /Ember/Cases (see Voxhora handoff doc 2026-05-25 for seed)
 
-def _resolve_case_uuid(cause_number: str) -> str | None:
-    """v1 placeholder: read from env var VOXHORA_TECHSHARE_CASE_UUID.
-
-    Voxhora-Mac's TechShareEmailParser will pre-resolve cause-number →
-    case-UUID by looking up the matching Case in SwiftData (Voxhora stores
-    the UUID on the Case row once it's been seen). For the very first
-    encounter, an HTML-scrape of /Ember/Cases will be needed (TBD).
+    Returns a dict {case_uuid, service_id, backend_port} or None.
     """
     import os
-    return os.environ.get("VOXHORA_TECHSHARE_CASE_UUID")
+    env_uuid = os.environ.get("VOXHORA_TECHSHARE_CASE_UUID")
+    env_sid = os.environ.get("VOXHORA_TECHSHARE_SERVICE_ID")
+    if env_uuid and env_sid:
+        # Infer port from service id; fall back to env override
+        port = int(os.environ.get("VOXHORA_TECHSHARE_BACKEND_PORT") or 0) or None
+        if port is None:
+            port = 1030 if env_sid == config.SERVICE_TRAVIS_COUNTY_ATTORNEY else 1031
+        return {"case_uuid": env_uuid, "service_id": env_sid, "backend_port": port}
+    return storage.lookup_case(cause_number)
 
 
 if __name__ == "__main__":
