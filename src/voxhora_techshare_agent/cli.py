@@ -223,6 +223,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
     seen = storage.load_seen_dme_ids()
     new_downloads = 0
+    failures = 0
     for item in dme_items:
         fp = storage.dme_fingerprint(item)
         if fp in seen:
@@ -231,17 +232,33 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         if item.is_archived:
             log.info("skip (archived): %s", item.name)
             continue
-        data = client.download_dme_file(service_id, item)
-        if item.is_pc_affidavit:
-            storage.write_pc_affidavit(item, data, cause_number)
-        else:
-            storage.write_case_discovery_file(item, data, cause_number)
-        seen.add(fp)
-        new_downloads += 1
+        try:
+            if item.is_pc_affidavit:
+                # PC affidavits go into Phase 1 OCR pipeline — caller
+                # (Voxhora's AutoIntakeWatcher) wants bytes for PDFKit.
+                # PCs are PDFs, max few MB; in-memory load is fine.
+                data = client.download_dme_file(service_id, item)
+                storage.write_pc_affidavit(item, data, cause_number)
+            else:
+                # Stream everything else directly to disk — videos can
+                # be 1+ GB; never hold them in RAM.
+                target = storage.case_discovery_target_path(item, cause_number)
+                bytes_written = client.download_dme_file_to_path(service_id, item, target)
+                log.info("streamed %s → %s (%d bytes)", item.name, target, bytes_written)
+            seen.add(fp)
+            new_downloads += 1
+            # Persist seen-set after EACH success so a mid-fetch crash
+            # doesn't re-download work already complete.
+            storage.save_seen_dme_ids(seen)
+        except Exception as e:
+            log.error("FAILED %s: %s", item.name, e)
+            failures += 1
+            # Persist seen-set even on partial failure
+            storage.save_seen_dme_ids(seen)
+            # Don't abort the loop — keep trying remaining items
 
-    storage.save_seen_dme_ids(seen)
-    print(f"OK — {cause_number}: {new_downloads} new files downloaded ({len(dme_items)} total in case)")
-    return 0
+    print(f"OK — {cause_number}: {new_downloads} new files downloaded, {failures} failed ({len(dme_items)} total in case)")
+    return 0 if failures == 0 else 2
 
 
 def _refresh_one_case(cause_number: str, client: TechShareClient) -> dict:

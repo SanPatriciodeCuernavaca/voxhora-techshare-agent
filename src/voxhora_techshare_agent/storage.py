@@ -99,6 +99,17 @@ def write_pc_affidavit(item: DMEItem, content: bytes, cause_number: str) -> Path
     return target
 
 
+def case_discovery_target_path(item: DMEItem, cause_number: str) -> Path:
+    """Build the destination path for a DME item in the per-case discovery folder.
+
+    Used by the streaming download path. Filenames preserve TechShare's
+    name verbatim (which embeds case number + Axon device + timestamp).
+    """
+    folder = config.dropbox_case_discovery_dir(cause_number)
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / item.name
+
+
 def write_case_discovery_file(item: DMEItem, content: bytes, cause_number: str) -> Path:
     """Write a DME item (video, audio, other) into the case-specific folder.
 

@@ -246,9 +246,11 @@ class TechShareSession:
         return self.api_post_json("/api/proxy", body)
 
     def proxy_download(self, service_id: str, backend_path: str) -> bytes:
-        """POST /api/proxy with a download-style endpoint (e.g. /dmefile).
+        """POST /api/proxy and return the full response body as bytes.
 
-        Returns the raw binary body. Caller writes to disk.
+        DEPRECATED for files larger than a few MB — use proxy_download_to_path
+        instead. For multi-GB bodycam videos this OOMs by holding the entire
+        response in RAM. Kept for small responses (case-list, etc.).
         """
         url = f"{config.TECHSHARE_BASE_URL}/api/proxy"
         body = {
@@ -260,9 +262,62 @@ class TechShareSession:
             "Content-Type": "application/json",
             "X-CSRF-Token": self.csrf_token(),
         }
-        r = self._session.post(url, json=body, headers=headers, timeout=600, stream=True)
+        # connect timeout 15s, read timeout None (no cap for slow responses)
+        r = self._session.post(url, json=body, headers=headers, timeout=(15, None), stream=True)
         r.raise_for_status()
         return r.content
+
+    def proxy_download_to_path(
+        self,
+        service_id: str,
+        backend_path: str,
+        target_path: Path,
+        chunk_size: int = 8 * 1024 * 1024,  # 8 MB chunks
+    ) -> int:
+        """Stream a download from /api/proxy directly to `target_path`.
+
+        Writes to <target>.partial first, atomically renames on success.
+        Cleans up the partial file on any exception (including
+        KeyboardInterrupt / process termination signal).
+
+        Returns the number of bytes written. Use this for large DME items
+        (videos, multi-GB ZIPs) — never holds the full body in RAM.
+        """
+        import os
+        url = f"{config.TECHSHARE_BASE_URL}/api/proxy"
+        body = {
+            "externalServiceId": service_id,
+            "Method": "GET",
+            "Path": backend_path,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": self.csrf_token(),
+        }
+        # No read-timeout cap — multi-hour video downloads must not die mid-stream.
+        # connect=15s, read=None.
+        r = self._session.post(url, json=body, headers=headers, timeout=(15, None), stream=True)
+        r.raise_for_status()
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        partial = target_path.with_suffix(target_path.suffix + ".partial")
+        bytes_written = 0
+        try:
+            with open(partial, "wb") as f:
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        bytes_written += len(chunk)
+            os.replace(partial, target_path)
+            return bytes_written
+        except BaseException:
+            # Catch BaseException (covers KeyboardInterrupt / SystemExit
+            # too) so .partial files don't pile up on cancellation.
+            try:
+                partial.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
     # ----- session-state helpers -----
 

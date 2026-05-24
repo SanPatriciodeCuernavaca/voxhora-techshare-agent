@@ -17,6 +17,18 @@ from .session import TechShareSession
 log = logging.getLogger(__name__)
 
 
+def _ensure_download_mode(href: str) -> str:
+    """Force isStream=0 on a /dmefile URL so the server returns
+    Content-Disposition: attachment + the full file body instead of
+    streaming-for-browser-playback. Used for both download_dme_file
+    and download_dme_file_to_path."""
+    if "isStream=1" in href:
+        return href.replace("isStream=1", "isStream=0")
+    if "isStream=" in href:
+        return href  # already 0
+    return href + ("&isStream=0" if "?" in href else "?isStream=0")
+
+
 class TechShareClient:
     """High-level operations layered on TechShareSession."""
 
@@ -67,25 +79,35 @@ class TechShareClient:
     # ----- file download -----
 
     def download_dme_file(self, service_id: str, item: DMEItem) -> bytes:
-        """Download the binary content of a DME item via its enclosure link.
+        """Download a DME item's bytes into memory.
 
-        Returns raw bytes. Caller writes to disk with the desired filename.
-        For large videos, this materializes the full body in memory; future
-        enhancement: streaming-write via session.proxy_download_stream.
+        DEPRECATED for large items — use download_dme_file_to_path for any
+        non-PDF item (videos, multi-GB ZIPs). This method OOMs for the
+        1.28 GB-typical bodycam videos. Kept for small items where the
+        caller specifically wants bytes (e.g. PC affidavits being passed
+        to PDFKit text-extract in the existing Phase 1 pipeline).
         """
         if not item.enclosure_href:
             raise ValueError(f"DME item {item.name!r} has no enclosure link")
-        # The /dmefile endpoint takes ?dmeId=... &isStream=0|1.
-        # Defaults from TechShare's Ember UI include isStream=1 (browser
-        # playback). We force isStream=0 for download semantics.
-        href = item.enclosure_href
-        if "isStream=" in href:
-            href = href.replace("isStream=1", "isStream=0")
-        elif "?" in href:
-            href = href + "&isStream=0"
-        else:
-            href = href + "?isStream=0"
+        href = _ensure_download_mode(item.enclosure_href)
         return self.session.proxy_download(service_id, href)
+
+    def download_dme_file_to_path(
+        self,
+        service_id: str,
+        item: DMEItem,
+        target_path,
+    ) -> int:
+        """Stream a DME item directly to `target_path`. Returns bytes written.
+
+        Safe for arbitrarily large items — writes via .partial + atomic
+        rename. Cleans up on any failure. Use this for everything except
+        PC affidavits in the Phase 1 in-memory OCR pipeline.
+        """
+        if not item.enclosure_href:
+            raise ValueError(f"DME item {item.name!r} has no enclosure link")
+        href = _ensure_download_mode(item.enclosure_href)
+        return self.session.proxy_download_to_path(service_id, href, target_path)
 
     # ----- case search (TBD — schema partial from recon) -----
 
