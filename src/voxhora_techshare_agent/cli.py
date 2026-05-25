@@ -146,14 +146,21 @@ def cmd_process_email(args: argparse.Namespace) -> int:
 
     resolved = _resolve_case(event.cause_number)
     if not resolved:
-        log.error(
-            "Cannot resolve case %s — not in cause→UUID cache. Run "
-            "`voxhora-techshare-agent refresh-cases` after logging in to "
-            "TechShare, or pass VOXHORA_TECHSHARE_CASE_UUID + "
-            "VOXHORA_TECHSHARE_SERVICE_ID env vars.",
+        # Email references a cause not in Patrick's cache (closed case,
+        # archived, or never-added-to-Voxhora). Nothing for the agent to
+        # do; exit success so the caller (MailInboxWatcher) green-flags
+        # the email and skips it forever instead of looping retries.
+        log.info(
+            "skip — cause %s not in cause→UUID cache (no Voxhora client); marking email handled",
             event.cause_number,
         )
-        return 4
+        storage.record_run_result(
+            mode="process-email",
+            cause_number=event.cause_number,
+            event_type=event.event_type,
+            error="not_in_cache_skipped",
+        )
+        return 0
     service_id = resolved["service_id"]
     case_uuid = resolved["case_uuid"]
 
