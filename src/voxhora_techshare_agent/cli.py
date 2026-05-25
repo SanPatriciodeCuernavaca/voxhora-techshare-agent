@@ -5,9 +5,12 @@ Subcommands:
   login            store TechShare credentials in macOS Keychain
   status           diagnostic: session valid? CSRF fresh? last run?
   process-email    read email body from stdin, process one event
-  fetch            on-demand bulk discovery pull for ONE case (videos + all DME)
-  backfill         one-time scan over a date range (NOT YET WIRED — needs
-                   AppleScript Mail.app iteration; v1 stub)
+  fetch            on-demand bulk discovery pull for ONE case (all DME)
+  fetch-items      download specific DME item IDs only (Portal-driven, 2026-05-25)
+  list             return JSON inventory of a case's DME items, no downloads (2026-05-25)
+  refresh          light refresh — PC + plea only
+  backfill         one-time scan over a date range (v1 stub)
+  backfill-all     light refresh over every cached case (PC + plea each)
 
 Each subcommand wires TechShareSession + TechShareClient + storage together.
 """
@@ -16,8 +19,11 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import logging
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Sequence
 
 from . import config, storage
@@ -50,6 +56,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     fc.add_argument("cause_number", help="e.g. C1CR26203830 or D1DC23207931")
     fc.add_argument("--service-id", default=None, help="Service UUID override (default: from case cache)")
     fc.add_argument("--case-uuid", default=None, help="Case UUID override (default: from case cache)")
+    fc.add_argument("--target-dir", default=None, help="Override download destination (default: ~/Dropbox/Voxhora/Case_Discovery/<cause>/). Used by Voxhora-Mac's Discovery Portal to route into per-client folder layout.")
+    fc.add_argument("--manifest", default=None, help="After fetch, write a JSON manifest at this path mapping item id → {path, size_bytes, downloaded_at}. Portal reads this to render the on-disk state.")
+
+    # Phase 0.3 (2026-05-25) — Portal-driven per-item fetch + inventory list.
+    fi = sub.add_parser("fetch-items", help="Download specific DME items by id (Portal-driven, Phase 0.3).")
+    fi.add_argument("cause_number", help="e.g. C1CR26203830")
+    fi.add_argument("item_ids", nargs="+", help="One or more DME item identifiers. Accept either a bare dmeId UUID OR the full fingerprint emitted by `list` (e.g. 'dmeId:abc-123' or 'compose:filename|size|date').")
+    fi.add_argument("--service-id", default=None)
+    fi.add_argument("--case-uuid", default=None)
+    fi.add_argument("--target-dir", default=None, help="Override download destination (default: per-cause folder).")
+    fi.add_argument("--manifest", default=None, help="After fetch, write JSON manifest at this path.")
+
+    ls = sub.add_parser("list", help="Return JSON inventory of a case's DME items — no downloads (Phase 0.3).")
+    ls.add_argument("cause_number", help="e.g. C1CR26203830")
+    ls.add_argument("--service-id", default=None)
+    ls.add_argument("--case-uuid", default=None)
+    ls.add_argument("--no-cache", action="store_true", help="Bypass the 1-hour list cache; force a fresh fetch from TechShare.")
+    ls.add_argument("--max-age", type=int, default=3600, help="Cache TTL in seconds (default 3600 = 1 hour).")
 
     bf = sub.add_parser("backfill", help="One-time scan over a date range (stub in v1).")
     bf.add_argument("--from", dest="from_date", required=True, help="ISO date e.g. 2026-01-01")
@@ -70,6 +94,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "status": cmd_status,
         "process-email": cmd_process_email,
         "fetch": cmd_fetch,
+        "fetch-items": cmd_fetch_items,
+        "list": cmd_list,
         "backfill": cmd_backfill,
         "refresh": cmd_refresh,
         "backfill-all": cmd_backfill_all,
@@ -206,6 +232,7 @@ def cmd_process_email(args: argparse.Namespace) -> int:
 
 
 def cmd_fetch(args: argparse.Namespace) -> int:
+    """Pull all DME for one cause. Phase 0.3 adds --target-dir and --manifest."""
     cause_number = args.cause_number
 
     # Resolve from cache unless overridden on CLI
@@ -220,6 +247,9 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         )
         return 4
 
+    target_dir = Path(args.target_dir).expanduser() if args.target_dir else None
+    manifest_path = Path(args.manifest).expanduser() if args.manifest else None
+
     session = TechShareSession()
     session.ensure_authenticated()
     client = TechShareClient(session)
@@ -229,6 +259,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     log.info("fetch %s: %d DME items total", cause_number, len(dme_items))
 
     seen = storage.load_seen_dme_ids()
+    manifest_entries: dict[str, dict] = {}
     new_downloads = 0
     failures = 0
     for item in dme_items:
@@ -245,15 +276,20 @@ def cmd_fetch(args: argparse.Namespace) -> int:
                 # (Voxhora's AutoIntakeWatcher) wants bytes for PDFKit.
                 # PCs are PDFs, max few MB; in-memory load is fine.
                 data = client.download_dme_file(service_id, item)
-                storage.write_pc_affidavit(item, data, cause_number)
+                written_path = storage.write_pc_affidavit(item, data, cause_number)
+                size_bytes = len(data)
             else:
                 # Stream everything else directly to disk — videos can
                 # be 1+ GB; never hold them in RAM.
-                target = storage.case_discovery_target_path(item, cause_number)
-                bytes_written = client.download_dme_file_to_path(service_id, item, target)
-                log.info("streamed %s → %s (%d bytes)", item.name, target, bytes_written)
+                written_path = storage.case_discovery_target_path(
+                    item, cause_number, target_dir=target_dir
+                )
+                bytes_written = client.download_dme_file_to_path(service_id, item, written_path)
+                size_bytes = bytes_written
+                log.info("streamed %s → %s (%d bytes)", item.name, written_path, bytes_written)
             seen.add(fp)
             new_downloads += 1
+            manifest_entries[fp] = _manifest_entry(item, written_path, size_bytes)
             # Persist seen-set after EACH success so a mid-fetch crash
             # doesn't re-download work already complete.
             storage.save_seen_dme_ids(seen)
@@ -264,8 +300,252 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             storage.save_seen_dme_ids(seen)
             # Don't abort the loop — keep trying remaining items
 
+    if manifest_path is not None:
+        _write_manifest(manifest_path, cause_number, manifest_entries)
+        log.info("wrote manifest: %s (%d entries)", manifest_path, len(manifest_entries))
+
     print(f"OK — {cause_number}: {new_downloads} new files downloaded, {failures} failed ({len(dme_items)} total in case)")
     return 0 if failures == 0 else 2
+
+
+def cmd_fetch_items(args: argparse.Namespace) -> int:
+    """Phase 0.3 — Portal-driven per-item fetch.
+
+    The Discovery Portal calls `list <cause>` to inventory + selects items
+    (via checkboxes / type-filter buttons / individual picks), then calls
+    `fetch-items <cause> <id> [<id>...]` to download only those.
+
+    Item identifiers are the fingerprints emitted by `list`. We accept
+    either a bare dmeId UUID (auto-prefixed with 'dmeId:') or the full
+    fingerprint string ('dmeId:...' or 'compose:...').
+
+    --target-dir and --manifest behave identically to `fetch`.
+    """
+    cause_number = args.cause_number
+    resolved = _resolve_case(cause_number) or {}
+    service_id = args.service_id or resolved.get("service_id")
+    case_uuid = args.case_uuid or resolved.get("case_uuid")
+    if not service_id or not case_uuid:
+        log.error("Cannot resolve %s for fetch-items.", cause_number)
+        return 4
+
+    requested = _normalize_fingerprints(args.item_ids)
+    if not requested:
+        log.error("No item ids provided.")
+        return 1
+
+    target_dir = Path(args.target_dir).expanduser() if args.target_dir else None
+    manifest_path = Path(args.manifest).expanduser() if args.manifest else None
+
+    session = TechShareSession()
+    session.ensure_authenticated()
+    client = TechShareClient(session)
+
+    case = client.get_case_detail(service_id, case_uuid)
+    dme_items = client.get_dme_list(service_id, case)
+
+    # Filter to requested fingerprints. Items not found in the live list
+    # (e.g., stale Portal manifest) are reported as failures but don't
+    # abort the rest of the batch.
+    fingerprint_to_item = {storage.dme_fingerprint(item): item for item in dme_items}
+    missing = sorted(requested - set(fingerprint_to_item.keys()))
+    to_fetch = [fingerprint_to_item[fp] for fp in requested if fp in fingerprint_to_item]
+    log.info(
+        "fetch-items %s: %d requested, %d resolved, %d missing",
+        cause_number, len(requested), len(to_fetch), len(missing),
+    )
+    for fp in missing:
+        log.warning("requested fingerprint not in live DME list: %s", fp)
+
+    seen = storage.load_seen_dme_ids()
+    manifest_entries: dict[str, dict] = {}
+    new_downloads = 0
+    failures = len(missing)  # missing items count as failures
+    for item in to_fetch:
+        fp = storage.dme_fingerprint(item)
+        if fp in seen:
+            log.info("skip (already-seen): %s", item.name)
+            # Still surface in manifest so the Portal sees the existing on-disk state
+            existing_path = storage.case_discovery_target_path(
+                item, cause_number, target_dir=target_dir
+            )
+            if existing_path.exists():
+                manifest_entries[fp] = _manifest_entry(item, existing_path, existing_path.stat().st_size)
+            continue
+        if item.is_archived:
+            log.info("skip (archived): %s", item.name)
+            continue
+        try:
+            if item.is_pc_affidavit:
+                data = client.download_dme_file(service_id, item)
+                written_path = storage.write_pc_affidavit(item, data, cause_number)
+                size_bytes = len(data)
+            else:
+                written_path = storage.case_discovery_target_path(
+                    item, cause_number, target_dir=target_dir
+                )
+                size_bytes = client.download_dme_file_to_path(service_id, item, written_path)
+                log.info("streamed %s → %s (%d bytes)", item.name, written_path, size_bytes)
+            seen.add(fp)
+            new_downloads += 1
+            manifest_entries[fp] = _manifest_entry(item, written_path, size_bytes)
+            storage.save_seen_dme_ids(seen)
+        except Exception as e:
+            log.error("FAILED %s: %s", item.name, e)
+            failures += 1
+            storage.save_seen_dme_ids(seen)
+
+    if manifest_path is not None:
+        _write_manifest(manifest_path, cause_number, manifest_entries)
+        log.info("wrote manifest: %s (%d entries)", manifest_path, len(manifest_entries))
+
+    print(
+        f"OK — {cause_number}: {new_downloads} new files, {failures} failed, "
+        f"{len(requested) - len(missing) - new_downloads} skipped-already-on-disk"
+    )
+    return 0 if failures == 0 else 2
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """Phase 0.3 — emit JSON inventory of a case's DME items.
+
+    No bytes downloaded. Per-cause 1-hour cache reduces TechShare audit
+    footprint when the Portal browses back-and-forth.
+    """
+    cause_number = args.cause_number
+
+    # Cache hit path
+    if not args.no_cache:
+        cached = storage.load_list_cache(cause_number, max_age_seconds=args.max_age)
+        if cached is not None:
+            print(json.dumps(cached, indent=2, sort_keys=True))
+            return 0
+
+    # Cache miss / bypassed — fetch live
+    resolved = _resolve_case(cause_number) or {}
+    service_id = args.service_id or resolved.get("service_id")
+    case_uuid = args.case_uuid or resolved.get("case_uuid")
+    if not service_id or not case_uuid:
+        log.error("Cannot resolve %s for list.", cause_number)
+        return 4
+
+    session = TechShareSession()
+    session.ensure_authenticated()
+    client = TechShareClient(session)
+
+    case = client.get_case_detail(service_id, case_uuid)
+    dme_items = client.get_dme_list(service_id, case)
+
+    payload = {
+        "cause_number": cause_number,
+        "case_number": case.case_number,
+        "defendant_name": case.defendant_name,
+        "status": case.status,
+        "total_dme_size": case.total_dme_size,
+        "is_archived": case.is_archived,
+        "cached_at_utc": datetime.now(timezone.utc).isoformat(),
+        "items": [_list_item_json(item) for item in dme_items],
+    }
+
+    storage.save_list_cache(cause_number, payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+# ----- helpers (Phase 0.3) -----
+
+
+def _normalize_fingerprints(raw_ids: list[str]) -> set[str]:
+    """Accept either bare UUIDs or full fingerprint strings. Returns the
+    normalized set ready to match against `storage.dme_fingerprint(item)`.
+    """
+    import re
+    uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+    out: set[str] = set()
+    for raw in raw_ids:
+        raw = raw.strip()
+        if not raw:
+            continue
+        if raw.startswith("dmeId:") or raw.startswith("compose:"):
+            out.add(raw)
+        elif uuid_re.match(raw):
+            out.add(f"dmeId:{raw}")
+        else:
+            log.warning("unrecognized item id format (skipping): %s", raw)
+    return out
+
+
+def _classify_item(item: DMEItem) -> str:
+    """Map a DMEItem to Portal-level category (video|written|audio|other)
+    used by the Discovery Portal's filter chips + "Add all of type X"
+    bulk buttons. Filename extension is the primary signal; falls back to
+    TechShare's `type` label when extension is ambiguous.
+    """
+    name_lower = item.name.lower()
+    if name_lower.endswith((".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm")):
+        return "video"
+    if name_lower.endswith((".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")):
+        return "audio"
+    if name_lower.endswith((".pdf", ".txt", ".doc", ".docx", ".rtf")):
+        return "written"
+    # Fall back to TechShare's type label
+    if item.is_video:
+        return "video"
+    if item.is_audio:
+        return "audio"
+    if item.is_pc_affidavit or item.type.lower().endswith("affidavit"):
+        return "written"
+    return "other"
+
+
+def _list_item_json(item: DMEItem) -> dict:
+    return {
+        "id": storage.dme_fingerprint(item),
+        "name": item.name,
+        "type_label": item.type,
+        "category": _classify_item(item),
+        "source": item.source,
+        "size": item.size,
+        "available_date": item.available_date,
+        "last_accessed_date": item.last_accessed_date,
+        "is_archived": item.is_archived,
+        "is_pc_affidavit": item.is_pc_affidavit,
+        "is_video": item.is_video,
+        "is_audio": item.is_audio,
+    }
+
+
+def _manifest_entry(item: DMEItem, path: Path, size_bytes: int) -> dict:
+    return {
+        "filename": item.name,
+        "type_label": item.type,
+        "category": _classify_item(item),
+        "size_bytes": int(size_bytes),
+        "size_string": item.size,
+        "path": str(path),
+        "downloaded_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _write_manifest(path: Path, cause_number: str, entries: dict[str, dict]) -> None:
+    """Atomically write the post-fetch manifest at `path`. If a manifest
+    already exists at that path, MERGE — preserve prior items so multiple
+    fetch-items calls accumulate.
+    """
+    existing: dict[str, dict] = {}
+    if path.exists():
+        try:
+            prior = json.loads(path.read_text())
+            existing = prior.get("items", {})
+        except Exception as e:
+            log.warning("prior manifest at %s unreadable (%s); overwriting", path, e)
+    merged = {**existing, **entries}
+    payload = {
+        "cause_number": cause_number,
+        "written_at_utc": datetime.now(timezone.utc).isoformat(),
+        "items": merged,
+    }
+    storage.atomic_write_json(path, payload)
 
 
 def _refresh_one_case(cause_number: str, client: TechShareClient) -> dict:

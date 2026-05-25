@@ -99,15 +99,92 @@ def write_pc_affidavit(item: DMEItem, content: bytes, cause_number: str) -> Path
     return target
 
 
-def case_discovery_target_path(item: DMEItem, cause_number: str) -> Path:
+def case_discovery_target_path(
+    item: DMEItem,
+    cause_number: str,
+    target_dir: Path | None = None,
+) -> Path:
     """Build the destination path for a DME item in the per-case discovery folder.
 
     Used by the streaming download path. Filenames preserve TechShare's
     name verbatim (which embeds case number + Axon device + timestamp).
+
+    2026-05-25 (Phase 0.3) — `target_dir` overrides the default
+    `config.dropbox_case_discovery_dir(cause_number)` when set. Used by
+    Voxhora-Mac's DownloadQueue (Phase 1) to write per-client folder
+    layout (`Discovery/<client>/<cause>/`) instead of the legacy flat
+    `Case_Discovery/<cause>/` path. When None (default), behavior
+    unchanged.
     """
-    folder = config.dropbox_case_discovery_dir(cause_number)
+    folder = target_dir if target_dir is not None else config.dropbox_case_discovery_dir(cause_number)
     folder.mkdir(parents=True, exist_ok=True)
     return folder / item.name
+
+
+# ----- list cache (Phase 0.3, 2026-05-25) -----
+#
+# Voxhora-Mac's Discovery Portal calls `list <cause>` to inventory a
+# case's DME items before queuing any downloads. Without caching, every
+# browse-back-and-forth in the Portal hits TechShare's /api/proxy
+# endpoint, which (per Travis County TOS) likely counts as a discovery-
+# touch audit entry. 1-hour cache TTL keeps the audit footprint clean
+# while still surfacing newly-added discovery within reasonable time.
+#
+# Per-cause cache file at:
+#   ~/Library/Application Support/voxhora-techshare-agent/<user>/list_cache/<cause>.json
+#
+# File contents: the verbatim JSON `list` subcommand would emit, plus
+# a `cached_at_utc` timestamp the loader checks against TTL.
+
+
+def list_cache_dir(username: str | None = None) -> Path:
+    base = config.state_dir(username) / "list_cache"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def list_cache_path(cause_number: str, username: str | None = None) -> Path:
+    return list_cache_dir(username) / f"{cause_number}.json"
+
+
+def load_list_cache(
+    cause_number: str,
+    max_age_seconds: int = 3600,
+    username: str | None = None,
+) -> dict | None:
+    """Return cached `list` JSON if present + fresh, else None."""
+    path = list_cache_path(cause_number, username)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except Exception as e:
+        log.warning("list cache for %s corrupt (%s); ignoring", cause_number, e)
+        return None
+    cached_at = payload.get("cached_at_utc")
+    if not cached_at:
+        return None
+    try:
+        ts = datetime.fromisoformat(cached_at.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    age = (datetime.now(timezone.utc) - ts).total_seconds()
+    if age > max_age_seconds:
+        log.info("list cache for %s expired (%.0fs old, max %ds)", cause_number, age, max_age_seconds)
+        return None
+    return payload
+
+
+def save_list_cache(
+    cause_number: str,
+    payload: dict,
+    username: str | None = None,
+) -> Path:
+    """Persist `list` JSON to the per-cause cache file."""
+    path = list_cache_path(cause_number, username)
+    # The caller already populated `cached_at_utc`; we just write through.
+    atomic_write_json(path, payload)
+    return path
 
 
 def write_case_discovery_file(item: DMEItem, content: bytes, cause_number: str) -> Path:
