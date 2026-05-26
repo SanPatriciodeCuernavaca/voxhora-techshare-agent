@@ -267,9 +267,13 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         if fp in seen:
             log.info("skip (already-seen): %s", item.name)
             continue
-        if item.is_archived:
-            log.info("skip (archived): %s", item.name)
-            continue
+        # Patrick 2026-05-27 LOCK — DO NOT skip on `is_archived`.
+        # TechShare flips that flag when the attorney has viewed an
+        # item on the web UI; it does NOT mean "should not download."
+        # seen_dme_ids (above) is the canonical "already-downloaded"
+        # gate. Photo ZIPs surfaced this bug — TechShare archived
+        # them after a web preview, the agent skipped them, photos
+        # never landed on disk.
         try:
             if item.is_pc_affidavit:
                 # PC affidavits go into Phase 1 OCR pipeline — caller
@@ -372,9 +376,12 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
             if existing_path.exists():
                 manifest_entries[fp] = _manifest_entry(item, existing_path, existing_path.stat().st_size)
             continue
-        if item.is_archived:
-            log.info("skip (archived): %s", item.name)
-            continue
+        # Patrick 2026-05-27 LOCK — `is_archived` is TechShare's
+        # "attorney viewed it on the web" flag, NOT a "should skip
+        # download" signal. Removed: bulk fetch downloads EVERYTHING
+        # not in seen_dme_ids regardless of TechShare's archived flag.
+        # Photo ZIPs in particular were silently archived by TechShare
+        # and never reached the local disk.
         try:
             if item.is_pc_affidavit:
                 data = client.download_dme_file(service_id, item)
@@ -488,6 +495,14 @@ def _classify_item(item: DMEItem) -> str:
         return "audio"
     if name_lower.endswith((".pdf", ".txt", ".doc", ".docx", ".rtf")):
         return "written"
+    # Patrick 2026-05-27 — photos arrive as image files (direct) OR as
+    # ZIP archives bundling multiple photos. Both surface in the Portal
+    # under filter chip "Images" / "Archives" so the attorney can
+    # see + bulk-add them by type.
+    if name_lower.endswith((".jpg", ".jpeg", ".png", ".heic", ".tiff", ".gif", ".webp", ".bmp")):
+        return "image"
+    if name_lower.endswith((".zip", ".7z", ".rar", ".tar", ".gz")):
+        return "archive"
     # Fall back to TechShare's type label
     if item.is_video:
         return "video"
