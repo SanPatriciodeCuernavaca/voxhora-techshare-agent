@@ -291,6 +291,17 @@ def cmd_fetch(args: argparse.Namespace) -> int:
                 bytes_written = client.download_dme_file_to_path(service_id, item, written_path)
                 size_bytes = bytes_written
                 log.info("streamed %s → %s (%d bytes)", item.name, written_path, bytes_written)
+                # Patrick 2026-05-27 — extract ZIP photo bundles inline
+                # so the Portal viewer sees individual JPEGs, not a dead
+                # ZIP icon. Original ZIP gets dot-prefixed to hide from
+                # the Portal grid while preserving bytes for audit.
+                if str(written_path).lower().endswith(".zip"):
+                    extracted_count = storage.extract_zip_inplace(written_path)
+                    if extracted_count > 0:
+                        hidden = storage.hide_zip_after_extract(written_path)
+                        log.info("extracted %d files from %s; hid original ZIP at %s",
+                                 extracted_count, written_path.name,
+                                 hidden.name if hidden else "(unchanged)")
             seen.add(fp)
             new_downloads += 1
             manifest_entries[fp] = _manifest_entry(item, written_path, size_bytes)
@@ -393,6 +404,17 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
                 )
                 size_bytes = client.download_dme_file_to_path(service_id, item, written_path)
                 log.info("streamed %s → %s (%d bytes)", item.name, written_path, size_bytes)
+                # Patrick 2026-05-27 — auto-extract ZIP photo bundles
+                # (same pattern as cmd_fetch above). Original ZIP gets
+                # dot-prefixed to hide from the Portal grid while
+                # preserving bytes for audit.
+                if str(written_path).lower().endswith(".zip"):
+                    extracted_count = storage.extract_zip_inplace(written_path)
+                    if extracted_count > 0:
+                        hidden = storage.hide_zip_after_extract(written_path)
+                        log.info("extracted %d files from %s; hid original ZIP at %s",
+                                 extracted_count, written_path.name,
+                                 hidden.name if hidden else "(unchanged)")
             seen.add(fp)
             new_downloads += 1
             manifest_entries[fp] = _manifest_entry(item, written_path, size_bytes)

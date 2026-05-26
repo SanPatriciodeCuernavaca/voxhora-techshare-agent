@@ -10,7 +10,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import tempfile
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -97,6 +99,77 @@ def write_pc_affidavit(item: DMEItem, content: bytes, cause_number: str) -> Path
     atomic_write_bytes(target, content)
     log.info("wrote PC affidavit: %s (%d bytes)", target, len(content))
     return target
+
+
+def extract_zip_inplace(zip_path: Path) -> int:
+    """Extract a ZIP archive's contents alongside it in the same folder,
+    flattening any internal directory structure. Returns the number of
+    files extracted, or 0 on corruption / extraction failure (caller
+    decides what to do — typically log + leave the ZIP intact).
+
+    Patrick 2026-05-27 — TechShare delivers photo bundles as ZIP
+    archives. Voxhora's Discovery Portal viewer (PDFKit/AVPlayer/audio
+    transport) doesn't read archives — the user sees a dead ZIP icon.
+    Solution: extract on download so individual JPEGs surface as files
+    the EvidenceGrid + viewers can render. The original ZIP is renamed
+    to `.<filename>` (leading dot → hidden file → DiscoveryFolderScanner's
+    `.skipsHiddenFiles` enumerator skips it) so the audit chain still
+    has the original artifact + Finder still shows it for evidentiary
+    reconstruction, but the Portal grid stays clean.
+
+    Filename-collision handling: if an extracted member name already
+    exists in the target folder, prefix with the ZIP's stem.
+    """
+    parent = zip_path.parent
+    extracted = 0
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for member in zf.namelist():
+                # Skip directory entries (zipfile lists them with trailing /)
+                if member.endswith("/"):
+                    continue
+                # Flatten any internal directory structure — use only the
+                # basename. Most TechShare photo ZIPs are flat anyway.
+                name = Path(member).name
+                if not name:
+                    continue
+                target = parent / name
+                if target.exists():
+                    target = parent / f"{zip_path.stem}_{name}"
+                with zf.open(member) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                extracted += 1
+    except zipfile.BadZipFile:
+        log.warning("ZIP corrupted, leaving intact: %s", zip_path.name)
+        return 0
+    except Exception as e:
+        log.error("ZIP extract failed for %s: %s", zip_path.name, e)
+        return 0
+    return extracted
+
+
+def hide_zip_after_extract(zip_path: Path) -> Path | None:
+    """Rename `Photos.zip` → `.Photos.zip` so DiscoveryFolderScanner's
+    `.skipsHiddenFiles` enumerator skips it from the Portal grid while
+    preserving bytes for audit. Returns the new hidden path, or None
+    if rename failed.
+    """
+    hidden = zip_path.parent / f".{zip_path.name}"
+    if hidden.exists():
+        # Already hidden version from a prior fetch — remove the new
+        # extracted ZIP rather than overwriting (audit-safer).
+        try:
+            zip_path.unlink()
+        except Exception as e:
+            log.warning("couldn't remove new ZIP %s (existing hidden present): %s",
+                        zip_path.name, e)
+        return hidden
+    try:
+        zip_path.rename(hidden)
+        return hidden
+    except Exception as e:
+        log.warning("couldn't hide ZIP %s after extract: %s", zip_path.name, e)
+        return None
 
 
 def case_discovery_target_path(
