@@ -59,6 +59,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     vr = sub.add_parser("verify", help="Verify TechShare credentials in Keychain by attempting a login. Exits 0 on success, 2 on bad creds.")
     vr.add_argument("--username", default=None, help="Override macOS keychain account (default: $USER). Multi-tenant future.")
 
+    # add-cause subcommand — Voxhora-Mac's AutoIntakeWatcher invokes this
+    # right after creating a new Case from a TC appointment letter, to
+    # seed the case_uuid_cache.json with the new cause→UUID mapping.
+    # Calls TechShare's /CaseByCaseNumber?caseNumber=<cause> endpoint
+    # via /api/proxy, extracts case-id, writes to cache. After
+    # add-cause succeeds, refresh <cause> can run and pull PC + plea
+    # offer. Exit 0 on success (added OR already in cache), 2 if
+    # TechShare returned no case for that cause, 1 on any other error.
+    ac = sub.add_parser("add-cause", help="Discover a cause's TechShare UUID via /CaseByCaseNumber endpoint and add to case_uuid_cache.json.")
+    ac.add_argument("cause_number", help="e.g. C1CR26206319 or D1DC26300823")
+
     pe = sub.add_parser("process-email", help="Process a single TechShare email body from stdin.")
     pe.add_argument("--subject", default=None, help="Email subject (optional, for logging).")
 
@@ -103,6 +114,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "login": cmd_login,
         "status": cmd_status,
         "verify": cmd_verify,
+        "add-cause": cmd_add_cause,
         "process-email": cmd_process_email,
         "fetch": cmd_fetch,
         "fetch-items": cmd_fetch_items,
@@ -138,6 +150,103 @@ def cmd_login(_args: argparse.Namespace) -> int:
         print("Re-run `voxhora-techshare-agent login` to update credentials.", file=sys.stderr)
         return 2
     print(f"OK — credentials stored in macOS Keychain (service={config.KEYCHAIN_SERVICE})")
+    return 0
+
+
+def cmd_add_cause(args: argparse.Namespace) -> int:
+    """Discover a cause's TechShare UUID + add to case_uuid_cache.json.
+
+    Voxhora-Mac's AutoIntakeWatcher invokes this right after creating
+    a new Case from a TC appointment letter so the subsequent `refresh
+    <cause>` call can resolve. Without this seeding step, brand-new
+    appointments hit "not_in_cache_skipped" in process-email and PC
+    affidavits / plea offers get silently dropped.
+
+    Endpoint pattern (verified live 2026-05-27):
+        POST /api/proxy
+        body: {externalServiceId: <service_uuid>, Method: GET,
+               Path: http://<backend>:<port>/CaseByCaseNumber?caseNumber=<cause>}
+        response: Collection+JSON with items[0].data containing
+                  case-id (the UUID we need)
+
+    Service routing by cause prefix:
+        C1CR... → Travis CA service (port 1030)
+        D1DC... → Travis DA service (port 1031)
+
+    Exit codes:
+        0 — cause added to cache OR already in cache
+        1 — network / auth / parse error
+        2 — TechShare returned no case for this cause
+        4 — unknown cause prefix (not C1CR or D1DC)
+    """
+    cause = args.cause_number.strip().upper()
+
+    # Determine service routing by cause prefix.
+    if cause.startswith("C1CR"):
+        service_id = config.SERVICE_TRAVIS_COUNTY_ATTORNEY
+        backend = config.BACKEND_CA
+        backend_port = 1030
+    elif cause.startswith("D1DC"):
+        service_id = config.SERVICE_TRAVIS_DISTRICT_ATTORNEY
+        backend = config.BACKEND_DA
+        backend_port = 1031
+    else:
+        print(f"ERROR: Unknown cause prefix in '{cause}' (expected C1CR or D1DC).", file=sys.stderr)
+        return 4
+
+    # Idempotency — skip the network round trip if cache already has it.
+    existing = storage.lookup_case(cause)
+    if existing:
+        print(f"OK — {cause} already in cache (UUID {existing.get('case_uuid')}, port {existing.get('backend_port')})")
+        return 0
+
+    # Auth + call the CaseByCaseNumber endpoint.
+    session = TechShareSession()
+    try:
+        session.ensure_authenticated()
+    except TechShareAuthError as e:
+        print(f"AUTH ERROR: {e}", file=sys.stderr)
+        return 1
+
+    backend_path = f"{backend}/CaseByCaseNumber?caseNumber={cause}"
+    try:
+        payload = session.api_post_json("/api/proxy", {
+            "externalServiceId": service_id,
+            "Method": "GET",
+            "Path": backend_path,
+        })
+    except Exception as e:
+        print(f"ERROR fetching CaseByCaseNumber for {cause}: {e}", file=sys.stderr)
+        return 1
+
+    # Parse Collection+JSON to extract case-id.
+    items = payload.get("collection", {}).get("items", [])
+    if not items:
+        print(f"ERROR: TechShare returned no case for cause {cause}. Either the cause doesn't exist OR the attorney isn't authorized for this case.", file=sys.stderr)
+        return 2
+
+    data_list = items[0].get("data", [])
+    case_uuid = None
+    for d in data_list:
+        if d.get("name") == "case-id":
+            case_uuid = d.get("value")
+            break
+
+    if not case_uuid:
+        print(f"ERROR: Could not extract case-id from /CaseByCaseNumber response for {cause}.", file=sys.stderr)
+        return 1
+
+    # Write to case_uuid_cache.json (same shape as the bulk-seeded
+    # entries: cause → {case_uuid, service_id, backend_port}).
+    cache = storage.load_case_cache()
+    cache[cause] = {
+        "case_uuid": case_uuid,
+        "service_id": service_id,
+        "backend_port": backend_port,
+    }
+    storage.atomic_write_json(config.case_uuid_cache_path(), cache)
+
+    print(f"OK — {cause} added to cache (UUID {case_uuid}, port {backend_port})")
     return 0
 
 
