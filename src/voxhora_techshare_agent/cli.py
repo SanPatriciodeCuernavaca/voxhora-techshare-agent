@@ -49,6 +49,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("login", help="Store TechShare credentials in macOS Keychain.")
     sub.add_parser("status", help="Show session + last-run status.")
 
+    # Verify subcommand — Voxhora-Mac's Attorney Profile "Sign in to
+    # TechShare" button invokes this after writing creds via Swift
+    # Keychain API. Reads creds from the existing keychain slot
+    # (service=voxhora-techshare-agent, account=getpass.getuser(),
+    # value=JSON({username, password})) and attempts a fresh form-POST
+    # login. Exits 0 on success, 2 on bad creds, 1 on any other error.
+    # No prompts, no stdin reads — pure side-effect-confirming probe.
+    vr = sub.add_parser("verify", help="Verify TechShare credentials in Keychain by attempting a login. Exits 0 on success, 2 on bad creds.")
+    vr.add_argument("--username", default=None, help="Override macOS keychain account (default: $USER). Multi-tenant future.")
+
     pe = sub.add_parser("process-email", help="Process a single TechShare email body from stdin.")
     pe.add_argument("--subject", default=None, help="Email subject (optional, for logging).")
 
@@ -92,6 +102,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     dispatch = {
         "login": cmd_login,
         "status": cmd_status,
+        "verify": cmd_verify,
         "process-email": cmd_process_email,
         "fetch": cmd_fetch,
         "fetch-items": cmd_fetch_items,
@@ -127,6 +138,34 @@ def cmd_login(_args: argparse.Namespace) -> int:
         print("Re-run `voxhora-techshare-agent login` to update credentials.", file=sys.stderr)
         return 2
     print(f"OK — credentials stored in macOS Keychain (service={config.KEYCHAIN_SERVICE})")
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Verify the keychain credentials by attempting a fresh form-POST
+    login. Caller (Voxhora-Mac's Attorney Profile "Sign in to TechShare"
+    button) wrote creds via Swift Keychain API to the EXACT slot we
+    read from (service=voxhora-techshare-agent, account=getpass.getuser()
+    by default, value=JSON({username, password})); this command confirms
+    those creds work end-to-end against TechShare's /api/auth endpoint
+    BEFORE the UI claims "✓ Signed in." On success the cookie jar is
+    populated so future agent calls reuse this authenticated session.
+    """
+    session = TechShareSession(username=args.username)
+    try:
+        session.login()
+    except TechShareAuthError as e:
+        # Surface the exact message for the UI to render inline. 2 ==
+        # auth error class (matches the main() exception handler's exit
+        # code for TechShareAuthError, so the UI can distinguish "bad
+        # creds" from "agent broke").
+        print(f"VERIFY FAILED: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        log.exception("verify failed with non-auth exception")
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    print(f"OK — TechShare login successful (keychain account: {session.username})")
     return 0
 
 
