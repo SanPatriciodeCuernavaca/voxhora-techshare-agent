@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voxhora-techshare-agent"
-version = "0.1.0"
-description = "Standalone TechShare discovery automation for Travis County criminal defense attorneys; pairs with Voxhora."
+version = "0.2.0"
+description = "TechShare discovery automation for Travis County criminal defense attorneys. Pairs with Voxhora. As of v0.2.0 (2026-05-27): cloud-agent friendly via credentials_override + cookie_storage='memory' constructor params on TechShareSession (used by voxhora-agent-cloud on Fly.io). Default behavior unchanged — Mac CLI flow + Voxhora-Mac DownloadJobsManager subprocess flow both pass through the legacy keychain + disk path."
 authors = [{name = "Patrick Fagerberg", email = "patrickfagerberg@icloud.com"}]
 requires-python = ">=3.9"
 dependencies = [

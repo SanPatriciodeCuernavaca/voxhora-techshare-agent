@@ -30,17 +30,48 @@ class TechShareAuthError(RuntimeError):
 
 
 class TechShareSession:
-    """Authenticated HTTP session against attorney.techsharetx.gov."""
+    """Authenticated HTTP session against attorney.techsharetx.gov.
 
-    def __init__(self, username: str | None = None) -> None:
+    Two operating modes (2026-05-27 BETA Cloud Agent ship):
+
+      1. **Mac CLI mode** (default) — `TechShareSession()` or
+         `TechShareSession(username=...)`. Credentials read from macOS
+         Keychain via `keyring`; cookies persisted to
+         `~/Library/Application Support/voxhora-techshare-agent/<user>/cookies.pickle`.
+         Unchanged behavior — this is what the Voxhora-Mac integration
+         and the standalone CLI both use.
+
+      2. **Cloud agent mode** — `TechShareSession(credentials_override=(username, password),
+         cookie_storage="memory")`. Bypasses keyring + disk; everything
+         lives in process memory. Used by voxhora-agent-cloud (Fly.io
+         FastAPI server) where creds come from Fly secrets and cookies
+         don't need to outlive the request worker.
+
+    Both modes share the same login + CSRF + proxy_* code paths.
+    """
+
+    def __init__(
+        self,
+        username: str | None = None,
+        *,
+        credentials_override: tuple[str, str] | None = None,
+        cookie_storage: str = "disk",
+    ) -> None:
         self.username = username or self._default_username()
         self._session = requests.Session()
         self._csrf_token: str | None = None
-        self._load_cookies()
+        self._credentials_override = credentials_override
+        if cookie_storage not in ("disk", "memory"):
+            raise ValueError(f"cookie_storage must be 'disk' or 'memory', got {cookie_storage!r}")
+        self._cookie_storage = cookie_storage
+        if self._cookie_storage == "disk":
+            self._load_cookies()
 
     # ----- cookie persistence -----
 
     def _load_cookies(self) -> None:
+        if self._cookie_storage != "disk":
+            return
         path = config.cookies_path(self.username)
         if not path.exists():
             log.debug("no persisted cookies for %s", self.username)
@@ -53,6 +84,8 @@ class TechShareSession:
             log.warning("failed to load cookies (%s); ignoring", e)
 
     def _save_cookies(self) -> None:
+        if self._cookie_storage != "disk":
+            return
         path = config.cookies_path(self.username)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
@@ -84,6 +117,8 @@ class TechShareSession:
         )
 
     def _retrieve_credentials(self) -> tuple[str, str]:
+        if self._credentials_override is not None:
+            return self._credentials_override
         import json
         raw = self._stored_password()
         if not raw:
