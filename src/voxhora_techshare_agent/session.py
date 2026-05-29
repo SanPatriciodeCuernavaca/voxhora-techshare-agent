@@ -439,11 +439,16 @@ class TechShareSession:
         """
         import os
         url = f"{config.DME_DOWNLOAD_BASE_URL}{download_link}"
-        # No read-timeout cap — multi-GB videos stream for minutes.
+        # Read timeout is the gap BETWEEN received chunks, not the total — a
+        # genuinely slow-but-progressing multi-GB stream keeps resetting it, so
+        # 120s never trips on real transfers. But a STALLED connection (server
+        # accepted then sends nothing) would otherwise hang forever with no cap;
+        # 120s makes it fail so the caller's retry re-preps + tries again
+        # instead of wedging the whole run (2026-05-29).
         r = self._session.get(
             url,
             cookies={"DefensePortalAuth": auth_cookie},
-            timeout=(15, None),
+            timeout=(15, 120),
             stream=True,
         )
         r.raise_for_status()
