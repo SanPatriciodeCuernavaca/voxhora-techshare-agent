@@ -358,10 +358,15 @@ class TechShareSession:
         """Stage a LARGE DME file for download via the web player's prep flow.
 
         POST /api/dme/download/prep with form fields ExternalServiceId + Url
-        (the /dmefile enclosure href). Returns 201 with an empty body but two
-        critical pieces in the response: a `downloadLink` header
-        (`/download?token=...`) and a `Set-Cookie: DefensePortalAuth=...`.
-        Together those let us GET the file from the DME content host.
+        (the /dmefile enclosure href). Returns 201 with an empty body. Each
+        prep returns a per-file `downloadLink` header (`/download?token=...`).
+        The accompanying `DefensePortalAuth` cookie is SESSION-LEVEL: TechShare
+        sets it via Set-Cookie on the FIRST prep of a session and does NOT
+        re-send it on later preps — the web player keeps it in its cookie jar
+        and reuses it for every subsequent video's downloadLink. So we must
+        capture it from the first prep that provides it, cache it for the rest
+        of the session, and fall back to the jar. (Reading only the per-RESPONSE
+        cookie made files 2..N fail with auth=False — the 2026-05-29 bug.)
 
         This exists because /api/proxy CANNOT serve multi-GB videos — it 500s
         instantly in download mode and hangs forever in stream mode (verified
@@ -382,13 +387,39 @@ class TechShareSession:
         )
         r.raise_for_status()
         link = r.headers.get("downloadLink")
-        auth = r.cookies.get("DefensePortalAuth")
+        auth = self._resolve_defense_portal_auth(r)
         if not link or not auth:
             raise RuntimeError(
                 f"prep returned no downloadLink/DefensePortalAuth "
                 f"(status {r.status_code}, link={bool(link)}, auth={bool(auth)})"
             )
         return link, auth
+
+    def _resolve_defense_portal_auth(self, response) -> str | None:
+        """Find the session-level DefensePortalAuth cookie set by prep.
+
+        Order: (1) this response's Set-Cookie, (2) the value cached from an
+        earlier prep this session, (3) the persisted cookie jar. Iterates
+        rather than calling .get() because the jar can legitimately hold more
+        than one DefensePortalAuth (one per domain/path) which makes .get()
+        raise CookieConflictError. Caches whatever it resolves so subsequent
+        preps in the same fetch run reuse it.
+        """
+        # 1) cookie set on THIS prep response (present on the first prep)
+        for ck in response.cookies:
+            if ck.name == "DefensePortalAuth" and ck.value:
+                self._dpa_cache = ck.value
+                return ck.value
+        # 2) cached from an earlier prep this session
+        cached = getattr(self, "_dpa_cache", None)
+        if cached:
+            return cached
+        # 3) jar fallback (conflict-safe) — take the most recently added
+        vals = [ck.value for ck in self._session.cookies if ck.name == "DefensePortalAuth" and ck.value]
+        if vals:
+            self._dpa_cache = vals[-1]
+            return vals[-1]
+        return None
 
     def prepared_download_to_path(
         self,
