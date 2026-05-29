@@ -8,6 +8,7 @@ callers work with clean dataclasses.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Iterable
 
 from . import config
@@ -111,11 +112,33 @@ class TechShareClient:
         DefensePortalAuth cookie prep hands back. This is exactly what the
         TechShare web video player does. Works for any DME size, so all
         streamed items (videos, audio, ZIPs, other) route through it.
+
+        Retries on transient failures (2026-05-29): multi-GB transfers against
+        TechShare's flaky server intermittently drop / time out / 500 partway —
+        the largest videos failed this way. Each attempt RE-PREPS (fresh
+        downloadLink/token) and prepared_download_to_path cleans up its .partial
+        on failure, so a retry starts clean. Exponential backoff between tries.
         """
         if not item.enclosure_href:
             raise ValueError(f"DME item {item.name!r} has no enclosure link")
-        link, auth = self.session.prep_dme_download(service_id, item.enclosure_href)
-        return self.session.prepared_download_to_path(link, auth, target_path)
+        max_attempts = 3
+        backoffs = [3, 8, 0]  # seconds before attempts 2 and 3
+        last_err: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                link, auth = self.session.prep_dme_download(service_id, item.enclosure_href)
+                return self.session.prepared_download_to_path(link, auth, target_path)
+            except Exception as e:  # transient network/timeout/5xx — retry
+                last_err = e
+                if attempt < max_attempts - 1:
+                    wait = backoffs[attempt]
+                    log.warning(
+                        "download attempt %d/%d failed for %s: %s — retrying in %ds",
+                        attempt + 1, max_attempts, item.name, e, wait,
+                    )
+                    if wait:
+                        time.sleep(wait)
+        raise last_err if last_err else RuntimeError(f"download failed for {item.name!r}")
 
     # ----- case search (TBD — schema partial from recon) -----
 
