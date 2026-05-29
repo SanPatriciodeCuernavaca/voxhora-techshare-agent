@@ -103,11 +103,19 @@ class TechShareClient:
         Safe for arbitrarily large items — writes via .partial + atomic
         rename. Cleans up on any failure. Use this for everything except
         PC affidavits in the Phase 1 in-memory OCR pipeline.
+
+        Uses the web player's PREP flow (2026-05-29): /api/proxy cannot serve
+        multi-GB videos (500s instantly in download mode, hangs forever in
+        stream mode), so we POST /api/dme/download/prep to stage the file,
+        then stream it from the dedicated DME content host with the
+        DefensePortalAuth cookie prep hands back. This is exactly what the
+        TechShare web video player does. Works for any DME size, so all
+        streamed items (videos, audio, ZIPs, other) route through it.
         """
         if not item.enclosure_href:
             raise ValueError(f"DME item {item.name!r} has no enclosure link")
-        href = _ensure_download_mode(item.enclosure_href)
-        return self.session.proxy_download_to_path(service_id, href, target_path)
+        link, auth = self.session.prep_dme_download(service_id, item.enclosure_href)
+        return self.session.prepared_download_to_path(link, auth, target_path)
 
     # ----- case search (TBD — schema partial from recon) -----
 

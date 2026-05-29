@@ -354,6 +354,87 @@ class TechShareSession:
                 pass
             raise
 
+    def prep_dme_download(self, service_id: str, dme_url: str) -> tuple[str, str]:
+        """Stage a LARGE DME file for download via the web player's prep flow.
+
+        POST /api/dme/download/prep with form fields ExternalServiceId + Url
+        (the /dmefile enclosure href). Returns 201 with an empty body but two
+        critical pieces in the response: a `downloadLink` header
+        (`/download?token=...`) and a `Set-Cookie: DefensePortalAuth=...`.
+        Together those let us GET the file from the DME content host.
+
+        This exists because /api/proxy CANNOT serve multi-GB videos — it 500s
+        instantly in download mode and hangs forever in stream mode (verified
+        2026-05-29). The web player uses this prep flow for every video.
+
+        Returns (download_link, defense_portal_auth_cookie).
+        """
+        url = f"{config.TECHSHARE_BASE_URL}/api/dme/download/prep"
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-CSRF-Token": self.csrf_token(),
+        }
+        r = self._session.post(
+            url,
+            data={"ExternalServiceId": service_id, "Url": dme_url},
+            headers=headers,
+            timeout=(15, 180),
+        )
+        r.raise_for_status()
+        link = r.headers.get("downloadLink")
+        auth = r.cookies.get("DefensePortalAuth")
+        if not link or not auth:
+            raise RuntimeError(
+                f"prep returned no downloadLink/DefensePortalAuth "
+                f"(status {r.status_code}, link={bool(link)}, auth={bool(auth)})"
+            )
+        return link, auth
+
+    def prepared_download_to_path(
+        self,
+        download_link: str,
+        auth_cookie: str,
+        target_path: Path,
+        chunk_size: int = 8 * 1024 * 1024,  # 8 MB chunks
+    ) -> int:
+        """Stream a prepped DME file from the DME content host to disk.
+
+        `download_link` + `auth_cookie` come from prep_dme_download(). The
+        DefensePortalAuth cookie is sent ONLY to the DME host (it is a
+        different domain than the API host, so the session jar won't attach
+        it automatically). Writes <target>.partial then atomically renames;
+        cleans up the partial on any exception (mirrors proxy_download_to_path).
+        Returns bytes written.
+        """
+        import os
+        url = f"{config.DME_DOWNLOAD_BASE_URL}{download_link}"
+        # No read-timeout cap — multi-GB videos stream for minutes.
+        r = self._session.get(
+            url,
+            cookies={"DefensePortalAuth": auth_cookie},
+            timeout=(15, None),
+            stream=True,
+        )
+        r.raise_for_status()
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        partial = target_path.with_suffix(target_path.suffix + ".partial")
+        bytes_written = 0
+        try:
+            with open(partial, "wb") as f:
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        bytes_written += len(chunk)
+            os.replace(partial, target_path)
+            return bytes_written
+        except BaseException:
+            try:
+                partial.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
     # ----- session-state helpers -----
 
     def is_authenticated(self) -> bool:

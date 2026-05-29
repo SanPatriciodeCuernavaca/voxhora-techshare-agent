@@ -17,6 +17,17 @@ SERVICE_TRAVIS_DISTRICT_ATTORNEY = "b278d33e-7e14-4abd-be16-6f22135d9193"
 BACKEND_CA = "http://198.214.211.41:1030"
 BACKEND_DA = "http://198.214.211.41:1031"
 
+# DME content host for LARGE-file downloads (videos, audio, big ZIPs).
+# These do NOT come through /api/proxy — that relay 500s instantly in
+# download mode and hangs indefinitely in stream mode on multi-GB files
+# (verified 2026-05-29). The TechShare web player instead POSTs
+# /api/dme/download/prep (which stages the file + returns a `downloadLink`
+# response header + a DefensePortalAuth cookie), then GETs the file from
+# this dedicated DME content host. Travis County host, captured 2026-05-29
+# by tracing the live web player's network traffic.
+DME_DOWNLOAD_HOST = "defensedmeca.traviscountytx.gov"
+DME_DOWNLOAD_BASE_URL = f"https://{DME_DOWNLOAD_HOST}"
+
 # Email sender that triggers agent processing
 TECHSHARE_SENDER = "TechShareProsecutor@traviscountytx.gov"
 
