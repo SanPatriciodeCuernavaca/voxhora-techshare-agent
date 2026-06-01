@@ -213,7 +213,9 @@ class TechShareSession:
             )
 
         self._save_cookies()
-        log.info("login successful for user '%s'", techshare_user)
+        # PII discipline (audit M1): don't log the portal username (captured into
+        # the shared ~/Voxhora_Logs trace).
+        log.info("login successful")
 
     # ----- CSRF -----
 

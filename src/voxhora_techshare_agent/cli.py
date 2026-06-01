@@ -339,7 +339,10 @@ def cmd_process_email(args: argparse.Namespace) -> int:
     case_uuid = resolved["case_uuid"]
 
     case = client.get_case_detail(service_id, case_uuid)
-    log.info("case loaded: %s defendant=%s status=%s", case.case_number, case.defendant_name, case.status)
+    # PII discipline (audit M1): this INFO line is captured into the shared
+    # ~/Voxhora_Logs trace, so it must not emit the defendant name. Cause number
+    # + status are the debuggable, non-identifying fields.
+    log.info("case loaded: %s status=%s (defendant nameLen=%d)", case.case_number, case.status, len(case.defendant_name or ""))
 
     pcs_downloaded = 0
     plea_captured = False
