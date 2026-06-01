@@ -13,6 +13,7 @@ cookies requests.Session collects after a successful login.
 from __future__ import annotations
 
 import logging
+import os
 import pickle
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ from typing import Any
 import keyring
 import requests
 
-from . import config
+from . import config, storage
 
 log = logging.getLogger(__name__)
 
@@ -88,8 +89,19 @@ class TechShareSession:
             return
         path = config.cookies_path(self.username)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "wb") as f:
-            pickle.dump(self._session.cookies, f)
+        # 2026-06-01 (audit H4): the persisted jar holds the LIVE
+        # DefensePortalAuth/government-portal session. Plain open() relied on the
+        # process umask and landed it world-readable (0644), so any local process
+        # could read + replay the session. Write owner-only (0600) + atomically
+        # via the same helper the rest of storage uses (NamedTemporaryFile is
+        # created 0600, the rename preserves it), then chmod the dir + any
+        # pre-existing 0644 jar to be safe on already-installed agents.
+        storage.atomic_write_bytes(path, pickle.dumps(self._session.cookies))
+        try:
+            os.chmod(path.parent, 0o700)
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
         log.debug("saved %d cookies", len(self._session.cookies))
 
     # ----- credentials -----
