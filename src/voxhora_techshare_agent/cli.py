@@ -250,6 +250,69 @@ def cmd_add_cause(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_and_cache_cause(cause: str, session) -> dict | None:
+    """Resolve a cause's TechShare case UUID via /CaseByCaseNumber and write it
+    to case_uuid_cache.json, reusing an already-authenticated session. Returns
+    the cache entry {case_uuid, service_id, backend_port} on success, or None
+    if TechShare has no case for it yet (PC not posted / attorney not
+    authorized / closed), an unknown cause prefix, or a network/parse error.
+
+    Powers the process-email SELF-HEAL (2026-06-03 — the "Maria" dropped-PC
+    fix): when a "new discovery" ping arrives for a cause that isn't cached,
+    the usual reason is that the case's initial `add-cause` ran BEFORE the PC
+    was posted (404 → nothing cached) and this ping is the PC finally landing —
+    at which point the case IS resolvable. So we resolve + cache it on the fly
+    and proceed, instead of dropping the PC forever. Kept separate from
+    cmd_add_cause so that command's exit-code contract stays untouched.
+    """
+    cause = cause.strip().upper()
+
+    existing = storage.lookup_case(cause)
+    if existing:
+        return existing
+
+    if cause.startswith("C1CR"):
+        service_id = config.SERVICE_TRAVIS_COUNTY_ATTORNEY
+        backend = config.BACKEND_CA
+        backend_port = 1030
+    elif cause.startswith("D1DC"):
+        service_id = config.SERVICE_TRAVIS_DISTRICT_ATTORNEY
+        backend = config.BACKEND_DA
+        backend_port = 1031
+    else:
+        return None
+
+    backend_path = f"{backend}/CaseByCaseNumber?caseNumber={cause}"
+    try:
+        payload = session.api_post_json("/api/proxy", {
+            "externalServiceId": service_id,
+            "Method": "GET",
+            "Path": backend_path,
+        })
+    except Exception as e:
+        log.warning("self-heal resolve failed for %s: %s", cause, e)
+        return None
+
+    items = payload.get("collection", {}).get("items", [])
+    if not items:
+        return None  # TechShare still has no case (PC not posted / not authorized)
+
+    case_uuid = None
+    for d in items[0].get("data", []):
+        if d.get("name") == "case-id":
+            case_uuid = d.get("value")
+            break
+    if not case_uuid:
+        return None
+
+    cache = storage.load_case_cache()
+    entry = {"case_uuid": case_uuid, "service_id": service_id, "backend_port": backend_port}
+    cache[cause] = entry
+    storage.atomic_write_json(config.case_uuid_cache_path(), cache)
+    log.info("self-heal: resolved + cached %s (UUID %s, port %d)", cause, case_uuid, backend_port)
+    return entry
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """Verify the keychain credentials by attempting a fresh form-POST
     login. Caller (Voxhora-Mac's Attorney Profile "Sign in to TechShare"
@@ -320,12 +383,22 @@ def cmd_process_email(args: argparse.Namespace) -> int:
 
     resolved = _resolve_case(event.cause_number)
     if not resolved:
-        # Email references a cause not in Patrick's cache (closed case,
-        # archived, or never-added-to-Voxhora). Nothing for the agent to
-        # do; exit success so the caller (MailInboxWatcher) green-flags
-        # the email and skips it forever instead of looping retries.
+        # SELF-HEAL (2026-06-03 — the "Maria" dropped-PC fix). The cause isn't
+        # cached. The dominant reason: its initial add-cause ran BEFORE the PC
+        # was posted to TechShare (404 → nothing cached), and THIS ping is the
+        # PC finally landing — so the case is resolvable NOW. Resolve + cache it
+        # on the fly using the session we already have, then proceed to download
+        # the PC, instead of dropping it forever (the old behavior that lost
+        # Maria's PC). TechShare only pings the attorney for cases they're
+        # appointed on, so a resolvable cause is always one worth fetching.
+        resolved = _resolve_and_cache_cause(event.cause_number, session)
+    if not resolved:
+        # Still unresolvable — TechShare genuinely has no case for it yet
+        # (PC not posted, attorney not authorized, or closed). Fall through to
+        # the original behavior: record + green-flag so the caller doesn't loop.
+        # Default-safe: no retry loop, no PC fetched for a non-existent case.
         log.info(
-            "skip — cause %s not in cause→UUID cache (no Voxhora client); marking email handled",
+            "skip — cause %s not resolvable in TechShare (no case yet / not authorized); marking email handled",
             event.cause_number,
         )
         storage.record_run_result(
