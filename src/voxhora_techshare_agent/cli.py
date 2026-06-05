@@ -463,6 +463,22 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     resolved = _resolve_case(cause_number) or {}
     service_id = args.service_id or resolved.get("service_id")
     case_uuid = args.case_uuid or resolved.get("case_uuid")
+
+    session = TechShareSession()
+    session.ensure_authenticated()
+
+    # SELF-HEAL (2026-06-05): if the cause isn't in the cause→UUID cache (and no
+    # CLI override), resolve + cache it on the fly via /CaseByCaseNumber — the
+    # SAME fix the process-email path uses (the "Maria" self-heal). A case whose
+    # initial add-cause 404'd because the PC wasn't posted yet IS resolvable
+    # later; without this the "download the rest of discovery" button fails with
+    # exit 4 forever (Victor Lorca Maldonado / D1DC26204255, 2026-06-05).
+    if not service_id or not case_uuid:
+        healed = _resolve_and_cache_cause(cause_number, session)
+        if healed:
+            service_id = service_id or healed.get("service_id")
+            case_uuid = case_uuid or healed.get("case_uuid")
+
     if not service_id or not case_uuid:
         log.error(
             "Cannot resolve %s — not in cause→UUID cache, and --service-id / "
@@ -474,8 +490,6 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     target_dir = Path(args.target_dir).expanduser() if args.target_dir else None
     manifest_path = Path(args.manifest).expanduser() if args.manifest else None
 
-    session = TechShareSession()
-    session.ensure_authenticated()
     client = TechShareClient(session)
 
     case = client.get_case_detail(service_id, case_uuid)
