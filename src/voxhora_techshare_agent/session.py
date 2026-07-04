@@ -453,6 +453,28 @@ class TechShareSession:
         """
         import os
         url = f"{config.DME_DOWNLOAD_BASE_URL}{download_link}"
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        partial = target_path.with_suffix(target_path.suffix + ".partial")
+
+        # 2026-07-04 RESUME — TechShare's DME host drops long streams at
+        # ~16-20 minutes (~1.7-2 GB observed live on C1CR26206809), so a
+        # restart-from-zero retry can NEVER finish a 2.5 GB video: every
+        # attempt dies at the same wall. If a prior attempt left a
+        # .partial, ask the host to resume from that offset (Range). The
+        # evidence file behind a dmeId is immutable, so bytes from a
+        # re-prepped link are identical — appending is safe. A 206 with
+        # the right offset appends; anything else restarts clean.
+        resume_from = 0
+        try:
+            resume_from = partial.stat().st_size if partial.exists() else 0
+        except OSError:
+            resume_from = 0
+        headers: dict[str, str] = {}
+        if resume_from > 0:
+            headers["Range"] = f"bytes={resume_from}-"
+            log.info("resuming %s from byte %d", target_path.name, resume_from)
+
         # Read timeout is the gap BETWEEN received chunks, not the total — a
         # genuinely slow-but-progressing multi-GB stream keeps resetting it, so
         # 120s never trips on real transfers. But a STALLED connection (server
@@ -464,14 +486,31 @@ class TechShareSession:
             cookies={"DefensePortalAuth": auth_cookie},
             timeout=(15, 120),
             stream=True,
+            headers=headers,
         )
         r.raise_for_status()
 
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        partial = target_path.with_suffix(target_path.suffix + ".partial")
-        bytes_written = 0
+        if resume_from > 0:
+            # Only trust the append path when the server provably honored
+            # the requested offset AND isn't transparently re-encoding the
+            # body (requests decodes Content-Encoding, which would break
+            # byte-offset math). Otherwise: restart from zero, truncating.
+            content_range = r.headers.get("Content-Range", "")
+            honored = (
+                r.status_code == 206
+                and content_range.startswith(f"bytes {resume_from}-")
+                and not r.headers.get("Content-Encoding")
+            )
+            if not honored:
+                log.info(
+                    "resume not honored for %s (status %d, Content-Range %r) — restarting from zero",
+                    target_path.name, r.status_code, content_range,
+                )
+                resume_from = 0
+
+        bytes_written = resume_from
         try:
-            with open(partial, "wb") as f:
+            with open(partial, "ab" if resume_from > 0 else "wb") as f:
                 for chunk in r.iter_content(chunk_size=chunk_size):
                     if chunk:
                         f.write(chunk)
@@ -479,10 +518,17 @@ class TechShareSession:
             os.replace(partial, target_path)
             return bytes_written
         except BaseException:
-            try:
-                partial.unlink()
-            except FileNotFoundError:
-                pass
+            # KEEP the partial whenever it holds real bytes — the caller's
+            # retry (or the lawyer's next Retry tap) RESUMES it instead of
+            # paying for the same gigabytes again. Delete only a truly
+            # empty fresh partial (nothing worth keeping). Note this also
+            # preserves prior-attempt bytes when a RESUMED attempt dies
+            # with zero new progress — that data is still good.
+            if resume_from == 0 and bytes_written == 0:
+                try:
+                    partial.unlink()
+                except FileNotFoundError:
+                    pass
             raise
 
     # ----- session-state helpers -----

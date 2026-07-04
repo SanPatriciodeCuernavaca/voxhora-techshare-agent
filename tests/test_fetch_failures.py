@@ -139,3 +139,103 @@ def test_retry_exhaustion_still_raises(tmp_path: Path, monkeypatch):
         client.download_dme_file_to_path("svc", _item("f.pdf", "1 KB"), tmp_path / "f.pdf")
     assert client.session.prep_calls == 3    # all attempts used
     assert client.session.reauth_calls == 2  # re-auth before each retry
+
+
+# ------------------------------------------------------ resume-from-partial
+
+from voxhora_techshare_agent.session import TechShareSession
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, body: bytes, headers: dict | None = None):
+        self.status_code = status_code
+        self._body = body
+        self.headers = headers or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def iter_content(self, chunk_size):
+        yield self._body
+
+
+class _FakeTransport:
+    """Stands in for requests.Session; records the Range header sent."""
+
+    def __init__(self, response: _FakeResponse):
+        self.response = response
+        self.sent_headers: dict | None = None
+
+    def get(self, url, cookies=None, timeout=None, stream=None, headers=None):
+        self.sent_headers = headers or {}
+        return self.response
+
+
+def _session_with(response: _FakeResponse) -> tuple[TechShareSession, _FakeTransport]:
+    s = TechShareSession.__new__(TechShareSession)
+    transport = _FakeTransport(response)
+    s._session = transport
+    return s, transport
+
+
+def test_resume_appends_on_honored_206(tmp_path: Path):
+    target = tmp_path / "video.mp4"
+    partial = tmp_path / "video.mp4.partial"
+    partial.write_bytes(b"AAAA")  # 4 bytes from a prior attempt
+    resp = _FakeResponse(206, b"BBBB", {"Content-Range": "bytes 4-7/8"})
+    s, transport = _session_with(resp)
+    written = s.prepared_download_to_path("/download?token=t", "auth", target)
+    assert transport.sent_headers.get("Range") == "bytes=4-"
+    assert written == 8
+    assert target.read_bytes() == b"AAAABBBB"
+    assert not partial.exists()
+
+
+def test_resume_restarts_clean_when_server_ignores_range(tmp_path: Path):
+    target = tmp_path / "video.mp4"
+    (tmp_path / "video.mp4.partial").write_bytes(b"OLD!")
+    resp = _FakeResponse(200, b"FRESHDATA")  # 200 = Range ignored
+    s, _ = _session_with(resp)
+    written = s.prepared_download_to_path("/download?token=t", "auth", target)
+    assert written == len(b"FRESHDATA")
+    assert target.read_bytes() == b"FRESHDATA"
+
+
+def test_resume_restarts_when_body_is_reencoded(tmp_path: Path):
+    target = tmp_path / "video.mp4"
+    (tmp_path / "video.mp4.partial").write_bytes(b"OLD!")
+    resp = _FakeResponse(206, b"FRESH", {"Content-Range": "bytes 4-8/9", "Content-Encoding": "gzip"})
+    s, _ = _session_with(resp)
+    written = s.prepared_download_to_path("/download?token=t", "auth", target)
+    assert target.read_bytes() == b"FRESH"
+    assert written == len(b"FRESH")
+
+
+def test_interrupted_stream_keeps_partial_for_next_resume(tmp_path: Path):
+    target = tmp_path / "video.mp4"
+
+    class _DyingResponse(_FakeResponse):
+        def iter_content(self, chunk_size):
+            yield b"SOMEBYTES"
+            raise TimeoutError("stream died")
+
+    s, _ = _session_with(_DyingResponse(200, b""))
+    with pytest.raises(TimeoutError):
+        s.prepared_download_to_path("/download?token=t", "auth", target)
+    partial = tmp_path / "video.mp4.partial"
+    assert partial.exists() and partial.read_bytes() == b"SOMEBYTES"
+
+
+def test_zero_byte_fresh_failure_deletes_partial(tmp_path: Path):
+    target = tmp_path / "video.mp4"
+
+    class _InstantDeath(_FakeResponse):
+        def iter_content(self, chunk_size):
+            raise TimeoutError("no bytes at all")
+            yield b""  # pragma: no cover
+
+    s, _ = _session_with(_InstantDeath(200, b""))
+    with pytest.raises(TimeoutError):
+        s.prepared_download_to_path("/download?token=t", "auth", target)
+    assert not (tmp_path / "video.mp4.partial").exists()
