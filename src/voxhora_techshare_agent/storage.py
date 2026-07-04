@@ -102,40 +102,49 @@ def write_pc_affidavit(item: DMEItem, content: bytes, cause_number: str) -> Path
 
 
 def extract_zip_inplace(zip_path: Path) -> int:
-    """Extract a ZIP archive's contents alongside it in the same folder,
-    flattening any internal directory structure. Returns the number of
-    files extracted, or 0 on corruption / extraction failure (caller
-    decides what to do — typically log + leave the ZIP intact).
+    """Extract a ZIP archive into a SUBFOLDER named after it (2026-07-04),
+    flattening the archive's internal directory structure inside that
+    subfolder. Returns the number of files extracted, or 0 on corruption /
+    extraction failure (caller decides what to do — typically log + leave
+    the ZIP intact).
 
     Patrick 2026-05-27 — TechShare delivers photo bundles as ZIP
     archives. Voxhora's Discovery Portal viewer (PDFKit/AVPlayer/audio
     transport) doesn't read archives — the user sees a dead ZIP icon.
-    Solution: extract on download so individual JPEGs surface as files
-    the EvidenceGrid + viewers can render. The original ZIP is renamed
-    to `.<filename>` (leading dot → hidden file → DiscoveryFolderScanner's
-    `.skipsHiddenFiles` enumerator skips it) so the audit chain still
-    has the original artifact + Finder still shows it for evidentiary
-    reconstruction, but the Portal grid stays clean.
+    Solution: extract on download. The original ZIP is renamed to
+    `.<filename>` (hidden) so the audit chain keeps the original artifact.
 
-    Filename-collision handling: if an extracted member name already
-    exists in the target folder, prefix with the ZIP's stem.
+    Patrick 2026-07-04 — extraction goes into `<case folder>/<zip stem>/`
+    now, NEVER loose into the case folder. The loose flatten was built
+    for 26-photo bundles and buried Richardson's 41 real evidence files
+    under 1,631 extracted ones when the county shipped a 1.5 GB
+    officer-records ZIP (a whole Windows video-player app: 238 DLLs,
+    451 help pages, plus real record PDFs). The Portal's local scanner
+    renders a subfolder as ONE bundle row ("each bundle should be one
+    file"); cloud-mode listing currently skips subfolders (bundle
+    collapse queued) — the files stay reachable via Finder/Dropbox.
+
+    Collision handling INSIDE the subfolder (two members in different
+    internal dirs sharing a basename): numeric suffixes — never
+    overwrite. (The old prefix-once logic silently overwrote on a
+    second collision; 427 of Richardson's members were lost that way,
+    recoverable only because the original ZIP is preserved.)
     """
-    parent = zip_path.parent
+    subdir = zip_path.parent / zip_path.stem
     extracted = 0
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            for member in zf.namelist():
-                # Skip directory entries (zipfile lists them with trailing /)
-                if member.endswith("/"):
-                    continue
-                # Flatten any internal directory structure — use only the
-                # basename. Most TechShare photo ZIPs are flat anyway.
+            members = [m for m in zf.namelist() if not m.endswith("/") and Path(m).name]
+            if members:
+                subdir.mkdir(exist_ok=True)
+            for member in members:
                 name = Path(member).name
-                if not name:
-                    continue
-                target = parent / name
-                if target.exists():
-                    target = parent / f"{zip_path.stem}_{name}"
+                target = subdir / name
+                counter = 2
+                while target.exists():
+                    stem, dot, ext = name.rpartition(".")
+                    target = subdir / (f"{stem}_{counter}.{ext}" if dot else f"{name}_{counter}")
+                    counter += 1
                 with zf.open(member) as src, open(target, "wb") as dst:
                     shutil.copyfileobj(src, dst)
                 extracted += 1

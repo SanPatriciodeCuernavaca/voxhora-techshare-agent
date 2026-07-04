@@ -73,3 +73,55 @@ def test_atomic_write_json_round_trip(tmp_path):
     # No tempfiles left behind
     leftover = [p for p in target.parent.iterdir() if p.name.startswith(".")]
     assert leftover == []
+
+
+# --------------------------------------------- ZIP extraction (2026-07-04)
+
+import zipfile as _zipfile
+
+from voxhora_techshare_agent.storage import extract_zip_inplace
+
+
+def _make_zip(path, members):
+    """members: dict of archive-internal-path -> bytes"""
+    with _zipfile.ZipFile(path, "w") as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+
+
+def test_extract_goes_into_subfolder_not_case_root(tmp_path):
+    z = tmp_path / "Photos(Count=2)_123.zip"
+    _make_zip(z, {"a.jpg": b"A", "b.jpg": b"B"})
+    n = extract_zip_inplace(z)
+    assert n == 2
+    sub = tmp_path / "Photos(Count=2)_123"
+    assert (sub / "a.jpg").read_bytes() == b"A"
+    assert (sub / "b.jpg").read_bytes() == b"B"
+    # nothing extracted loose into the case folder
+    loose = [f.name for f in tmp_path.iterdir() if f.is_file() and f.suffix == ".jpg"]
+    assert loose == []
+
+
+def test_extract_flattens_internal_dirs_inside_subfolder(tmp_path):
+    z = tmp_path / "records.zip"
+    _make_zip(z, {"deep/nested/report.pdf": b"R"})
+    assert extract_zip_inplace(z) == 1
+    assert (tmp_path / "records" / "report.pdf").read_bytes() == b"R"
+
+
+def test_extract_collisions_get_numeric_suffix_never_overwrite(tmp_path):
+    z = tmp_path / "dup.zip"
+    _make_zip(z, {"x/1.png": b"first", "y/1.png": b"second", "z/1.png": b"third"})
+    assert extract_zip_inplace(z) == 3
+    sub = tmp_path / "dup"
+    contents = sorted(p.name for p in sub.iterdir())
+    assert contents == ["1.png", "1_2.png", "1_3.png"]
+    # all three payloads survived — the old logic overwrote the third
+    assert {p.read_bytes() for p in sub.iterdir()} == {b"first", b"second", b"third"}
+
+
+def test_extract_empty_zip_creates_no_subfolder(tmp_path):
+    z = tmp_path / "empty.zip"
+    _make_zip(z, {})
+    assert extract_zip_inplace(z) == 0
+    assert not (tmp_path / "empty").exists()
