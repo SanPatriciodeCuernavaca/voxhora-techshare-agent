@@ -9,6 +9,7 @@ description = "TechShare discovery automation for Travis County criminal defense
 authors = [{name = "Patrick Fagerberg", email = "patrickfagerberg@icloud.com"}]
 requires-python = ">=3.9"
 dependencies = [
+    "extract-msg>=0.55",
     "requests>=2.31",
     "keyring>=24.0",
 ]

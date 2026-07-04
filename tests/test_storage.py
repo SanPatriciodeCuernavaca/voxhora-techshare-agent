@@ -125,3 +125,28 @@ def test_extract_empty_zip_creates_no_subfolder(tmp_path):
     _make_zip(z, {})
     assert extract_zip_inplace(z) == 0
     assert not (tmp_path / "empty").exists()
+
+
+# ------------------------------------------- .msg → .txt companions (2026-07-04)
+
+from voxhora_techshare_agent.storage import convert_msg_to_text
+
+
+def test_msg_conversion_never_raises_on_garbage(tmp_path):
+    bogus = tmp_path / "not-really-an-email.msg"
+    bogus.write_bytes(b"this is not an OLE compound file")
+    assert convert_msg_to_text(bogus) is None  # graceful, no exception
+    assert not (tmp_path / "not-really-an-email.msg.txt").exists()
+
+
+def test_zip_extraction_converts_msg_members(tmp_path, monkeypatch):
+    """extract_zip_inplace calls the converter for .msg members; verify the
+    hook fires (converter monkeypatched — crafting a real OLE file in-test
+    isn't worth it; the real converter is exercised above + in production)."""
+    import voxhora_techshare_agent.storage as storage_mod
+    calls = []
+    monkeypatch.setattr(storage_mod, "convert_msg_to_text", lambda p: calls.append(p) or None)
+    z = tmp_path / "emails.zip"
+    _make_zip(z, {"a.msg": b"x", "b.pdf": b"y"})
+    assert storage_mod.extract_zip_inplace(z) == 2
+    assert [p.name for p in calls] == ["a.msg"]

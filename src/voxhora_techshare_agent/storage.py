@@ -148,6 +148,11 @@ def extract_zip_inplace(zip_path: Path) -> int:
                 with zf.open(member) as src, open(target, "wb") as dst:
                     shutil.copyfileobj(src, dst)
                 extracted += 1
+                # 2026-07-04 — Outlook emails get a readable .txt companion
+                # so the Portal can display them (the .msg itself is a
+                # binary format no in-app viewer renders).
+                if target.suffix.lower() == ".msg":
+                    convert_msg_to_text(target)
     except zipfile.BadZipFile:
         log.warning("ZIP corrupted, leaving intact: %s", zip_path.name)
         return 0
@@ -155,6 +160,56 @@ def extract_zip_inplace(zip_path: Path) -> int:
         log.error("ZIP extract failed for %s: %s", zip_path.name, e)
         return 0
     return extracted
+
+
+def convert_msg_to_text(msg_path: Path) -> Path | None:
+    """Write a readable `<name>.msg.txt` companion next to an Outlook
+    .msg file (2026-07-04, Patrick: "I want to be able to read the
+    emails in the viewer"). .msg is a binary OLE format nothing in the
+    Portal can render; .txt opens in the existing QuickLook viewer.
+    Companion carries the headers + plain-text body. Attachments inside
+    the .msg are NOT extracted (noted in the companion footer; the
+    original .msg stays on disk for Outlook/Finder). Returns the
+    companion path, or None on any failure (never raises — a bad email
+    must not break a ZIP extraction).
+    """
+    try:
+        import extract_msg  # lazy — optional dependency
+    except ImportError:
+        log.warning("extract_msg not installed; skipping .msg conversion for %s", msg_path.name)
+        return None
+    try:
+        msg = extract_msg.openMsg(str(msg_path))
+        try:
+            body = (msg.body or "").strip()
+            attachment_names = [
+                getattr(a, "longFilename", None) or getattr(a, "shortFilename", None) or "(unnamed)"
+                for a in (msg.attachments or [])
+            ]
+            lines = [
+                f"Subject: {msg.subject or '(no subject)'}",
+                f"From:    {msg.sender or '(unknown)'}",
+                f"To:      {msg.to or '(unknown)'}",
+            ]
+            if msg.cc:
+                lines.append(f"Cc:      {msg.cc}")
+            lines.append(f"Date:    {msg.date or '(unknown)'}")
+            lines.append("-" * 60)
+            lines.append(body if body else "(no plain-text body in this email)")
+            if attachment_names:
+                lines.append("")
+                lines.append("-" * 60)
+                lines.append(f"[{len(attachment_names)} attachment(s) inside the original .msg — "
+                             "open it in Outlook/Finder to get them]")
+                lines.extend(f"  • {n}" for n in attachment_names)
+            target = msg_path.with_name(msg_path.name + ".txt")
+            target.write_text("\n".join(lines), encoding="utf-8")
+            return target
+        finally:
+            msg.close()
+    except Exception as e:
+        log.warning(".msg conversion failed for %s: %s", msg_path.name, e)
+        return None
 
 
 def hide_zip_after_extract(zip_path: Path) -> Path | None:
