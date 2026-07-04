@@ -497,3 +497,29 @@ class TechShareSession:
             return
         log.info("session not authenticated; attempting login")
         self.login()
+
+    def reauthenticate(self) -> None:
+        """Force a FRESH login mid-run (2026-07-04 root-cause fix).
+
+        The TechShare session — and its session-level DefensePortalAuth
+        pass — expires during hour-long multi-GB fetch runs. Once dead,
+        EVERY subsequent prep fails instantly (1 KB PDFs included), which
+        is exactly the "7 of 43 downloaded, 36 failed" pattern: the run's
+        early files succeed, everything after the expiry fails in seconds,
+        and the same files download fine the next day on a fresh session.
+
+        Clears every piece of cached auth state so nothing stale can leak
+        into the new session: the CSRF token, the cached DefensePortalAuth
+        value, and any DefensePortalAuth cookies in the jar (otherwise
+        _resolve_defense_portal_auth would happily hand back the dead one).
+        """
+        log.info("re-authenticating mid-run (session presumed expired)")
+        self._csrf_token = None
+        self._dpa_cache = None
+        stale = [ck for ck in self._session.cookies if ck.name == "DefensePortalAuth"]
+        for ck in stale:
+            try:
+                self._session.cookies.clear(ck.domain, ck.path, ck.name)
+            except KeyError:
+                pass
+        self.login()

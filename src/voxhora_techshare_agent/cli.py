@@ -21,6 +21,7 @@ import argparse
 import getpass
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -496,8 +497,17 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     dme_items = client.get_dme_list(service_id, case)
     log.info("fetch %s: %d DME items total", cause_number, len(dme_items))
 
+    # 2026-07-04 — SMALLEST FILES FIRST. The failure mode this guards:
+    # the TechShare session dies partway through a long run, and
+    # everything after it fails. With ascending-size order, a mid-run
+    # death costs the big-video tail (which retries + re-login now heal),
+    # never a pile of 1 KB PDFs and 4 MB photos that would each have
+    # streamed in under a second.
+    dme_items = sorted(dme_items, key=_size_kb)
+
     seen = storage.load_seen_dme_ids()
     manifest_entries: dict[str, dict] = {}
+    failed_items: list[dict] = []
     new_downloads = 0
     failures = 0
     for item in dme_items:
@@ -549,15 +559,30 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         except Exception as e:
             log.error("FAILED %s: %s", item.name, e)
             failures += 1
+            # 2026-07-04 — capture WHICH file failed and WHY, per item.
+            # Before this the reason lived only in stderr (discarded by the
+            # Mac app) and the lawyer got a bare count — no way to know
+            # which evidence to verify in TechShare.
+            failed_items.append({
+                "filename": item.name,
+                "id": fp,
+                "reason": str(e)[:300],
+            })
             # Persist seen-set even on partial failure
             storage.save_seen_dme_ids(seen)
             # Don't abort the loop — keep trying remaining items
 
     if manifest_path is not None:
-        _write_manifest(manifest_path, cause_number, manifest_entries)
+        _write_manifest(manifest_path, cause_number, manifest_entries, failed_items=failed_items)
         log.info("wrote manifest: %s (%d entries)", manifest_path, len(manifest_entries))
 
     print(f"OK — {cause_number}: {new_downloads} new files downloaded, {failures} failed ({len(dme_items)} total in case)")
+    # 2026-07-04 — machine-readable per-file failure list on stdout, AFTER
+    # the OK summary (the Mac app scans lines for the "OK — " prefix; this
+    # line is additive and invisible to older parsers). One line, one JSON
+    # array: [{"filename", "id", "reason"}].
+    if failed_items:
+        print("FAILED-ITEMS-JSON: " + json.dumps(failed_items, ensure_ascii=False))
     return 0 if failures == 0 else 2
 
 
@@ -742,6 +767,17 @@ def _normalize_fingerprints(raw_ids: list[str]) -> set[str]:
     return out
 
 
+def _size_kb(item: DMEItem) -> int:
+    """Parse TechShare's human size string ('2,524,423 KB') to an int sort
+    key (2026-07-04, smallest-first fetch order). Blank/unparseable sizes
+    sort LAST (treated as huge) so known-small wins always come first. Used
+    only for ORDERING — a non-KB unit would merely mis-order, never
+    mis-download.
+    """
+    digits = re.sub(r"[^\d]", "", item.size or "")
+    return int(digits) if digits else (1 << 60)
+
+
 def _classify_item(item: DMEItem) -> str:
     """Map a DMEItem to Portal-level category (video|written|audio|other)
     used by the Discovery Portal's filter chips + "Add all of type X"
@@ -802,16 +838,29 @@ def _manifest_entry(item: DMEItem, path: Path, size_bytes: int) -> dict:
     }
 
 
-def _write_manifest(path: Path, cause_number: str, entries: dict[str, dict]) -> None:
+def _write_manifest(
+    path: Path,
+    cause_number: str,
+    entries: dict[str, dict],
+    failed_items: list[dict] | None = None,
+) -> None:
     """Atomically write the post-fetch manifest at `path`. If a manifest
     already exists at that path, MERGE — preserve prior items so multiple
     fetch-items calls accumulate.
+
+    failed_items semantics (2026-07-04): a bulk `fetch` attempts EVERY
+    not-yet-seen item, so its failure list is the COMPLETE outstanding set
+    for the cause — it REPLACES the prior list (an item that succeeded this
+    run must drop off). Callers that only attempt a subset (fetch-items)
+    pass None, which PRESERVES the prior list untouched.
     """
     existing: dict[str, dict] = {}
+    prior_failed: list[dict] = []
     if path.exists():
         try:
             prior = json.loads(path.read_text())
             existing = prior.get("items", {})
+            prior_failed = prior.get("failed_items", [])
         except Exception as e:
             log.warning("prior manifest at %s unreadable (%s); overwriting", path, e)
     merged = {**existing, **entries}
@@ -819,6 +868,7 @@ def _write_manifest(path: Path, cause_number: str, entries: dict[str, dict]) -> 
         "cause_number": cause_number,
         "written_at_utc": datetime.now(timezone.utc).isoformat(),
         "items": merged,
+        "failed_items": prior_failed if failed_items is None else failed_items,
     }
     storage.atomic_write_json(path, payload)
 

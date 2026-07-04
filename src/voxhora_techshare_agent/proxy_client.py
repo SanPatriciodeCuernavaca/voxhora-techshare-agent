@@ -136,6 +136,18 @@ class TechShareClient:
                         "download attempt %d/%d failed for %s: %s — retrying in %ds",
                         attempt + 1, max_attempts, item.name, e, wait,
                     )
+                    # 2026-07-04 root-cause fix for the mass-failure runs:
+                    # the session-level DefensePortalAuth pass expires during
+                    # hour-long GB streams, after which every prep fails
+                    # instantly and re-prepping with the SAME dead session
+                    # can never recover. Re-login before ANY retry — ~0.3s,
+                    # trivial next to a re-prepped stream — so the first
+                    # failing file heals the session and the rest of the run
+                    # sails instead of "everything after minute 60 fails".
+                    try:
+                        self.session.reauthenticate()
+                    except Exception as auth_err:
+                        log.warning("mid-run re-login failed: %s", auth_err)
                     if wait:
                         time.sleep(wait)
         raise last_err if last_err else RuntimeError(f"download failed for {item.name!r}")
