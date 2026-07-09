@@ -104,7 +104,15 @@ class DMEItem:
 
     @property
     def is_pc_affidavit(self) -> bool:
-        return self.type == "PC Affidavit / Arrest Warrant"
+        # Tolerant match (2026-07-09, Patrick's review): the canonical
+        # TechShare Type label is "PC Affidavit / Arrest Warrant", but
+        # exact equality is brittle against spacing/case drift
+        # ("PC Affidavit/Arrest Warrant", trailing whitespace, …).
+        # Normalize case + whitespace and substring-match — matching is
+        # ALWAYS on TechShare's structured `type` field (the DME table's
+        # Type column), never the filename and never OCR/vision.
+        normalized = " ".join(self.type.lower().split())
+        return "pc affidavit" in normalized
 
     @property
     def is_video(self) -> bool:
