@@ -910,11 +910,26 @@ def _refresh_one_case(cause_number: str, client: TechShareClient) -> dict:
             continue
         try:
             data = client.download_dme_file(service_id, pc)
+        except Exception:
+            # Session death heals exactly like the bulk-fetch path
+            # (commit 2bcedfa): reauthenticate() clears CSRF + DPA +
+            # jar cookies, then ONE retry. Observed live 2026-07-09
+            # (C1CR25205353, "PC download failed: 401 Unauthorized" —
+            # the on-disk jar passed is_authenticated() but the DME
+            # download hit a dead session). Cost ~0.3 s; without this
+            # the whole PC loop broke on the first stale-session file.
+            try:
+                client.session.reauthenticate()
+                data = client.download_dme_file(service_id, pc)
+            except Exception as e:
+                result["error"] = f"PC download failed: {e}"
+                break
+        try:
             storage.write_pc_affidavit(pc, data, cause_number)
             seen.add(fp)
             result["pcs_downloaded"] += 1
         except Exception as e:
-            result["error"] = f"PC download failed: {e}"
+            result["error"] = f"PC write failed: {e}"
             break
     storage.save_seen_dme_ids(seen)
 
