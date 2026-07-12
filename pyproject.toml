@@ -12,6 +12,10 @@ dependencies = [
     "extract-msg>=0.55",
     "requests>=2.31",
     "keyring>=24.0",
+    # Static ffmpeg binary for discovery-video conversion (2026-07-11) —
+    # attorneys' Macs have no Homebrew; storage.find_ffmpeg() falls back
+    # to this wheel's bundled binary.
+    "imageio-ffmpeg>=0.5",
 ]
 
 [project.optional-dependencies]

@@ -150,3 +150,73 @@ def test_zip_extraction_converts_msg_members(tmp_path, monkeypatch):
     _make_zip(z, {"a.msg": b"x", "b.pdf": b"y"})
     assert storage_mod.extract_zip_inplace(z) == 2
     assert [p.name for p in calls] == ["a.msg"]
+
+
+# ------------------------------- video → Portal-playable mp4 (2026-07-11)
+
+from voxhora_techshare_agent.storage import (
+    convert_video_to_playable,
+    find_ffmpeg,
+    is_portal_unplayable_video,
+)
+
+
+def test_unplayable_detection_by_extension(tmp_path):
+    assert is_portal_unplayable_video(Path("cam.avi"))
+    assert is_portal_unplayable_video(Path("CAM.AVI"))
+    assert is_portal_unplayable_video(Path("body.wmv"))
+    assert not is_portal_unplayable_video(Path("dash.mp4"))
+    assert not is_portal_unplayable_video(Path("interview.mov"))
+    assert not is_portal_unplayable_video(Path("report.pdf"))
+
+
+def test_convert_skips_native_formats(tmp_path):
+    native = tmp_path / "already-fine.mp4"
+    native.write_bytes(b"x")
+    assert convert_video_to_playable(native) is None
+    assert native.exists()  # untouched
+
+
+def test_convert_real_avi_end_to_end(tmp_path):
+    """Synthesize a 1-second AVI with ffmpeg, convert it, and verify the
+    mp4 lands + the original is dot-prefix-hidden (audit bytes kept)."""
+    import subprocess
+
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None:
+        pytest.skip("no ffmpeg on this machine")
+    src = tmp_path / "surveillance.avi"
+    subprocess.run(
+        [ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i",
+         "testsrc=duration=1:size=320x240:rate=10", str(src)],
+        check=True, capture_output=True,
+    )
+    out = convert_video_to_playable(src)
+    assert out is not None and out.name == "surveillance.mp4"
+    assert out.stat().st_size > 1024
+    assert not src.exists()  # hidden, not deleted…
+    assert (tmp_path / ".surveillance.avi").exists()  # …bytes preserved
+
+
+def test_convert_garbage_leaves_original_visible(tmp_path):
+    """A corrupt video must fail soft: no mp4, original stays visible."""
+    if find_ffmpeg() is None:
+        pytest.skip("no ffmpeg on this machine")
+    bogus = tmp_path / "corrupt.avi"
+    bogus.write_bytes(b"RIFF not actually a video")
+    assert convert_video_to_playable(bogus) is None
+    assert bogus.exists()
+    assert not (tmp_path / "corrupt.mp4").exists()
+
+
+def test_convert_idempotent_when_mp4_exists(tmp_path):
+    """Re-fetch of an already-converted item returns the existing mp4
+    without touching anything (seen-set crash-resume path)."""
+    src = tmp_path / "cam.avi"
+    src.write_bytes(b"RIFF whatever")
+    existing = tmp_path / "cam.mp4"
+    existing.write_bytes(b"converted earlier")
+    out = convert_video_to_playable(src)
+    assert out == existing
+    assert existing.read_bytes() == b"converted earlier"
+    assert src.exists()  # this call didn't convert, so it didn't hide

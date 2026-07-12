@@ -550,6 +550,17 @@ def cmd_fetch(args: argparse.Namespace) -> int:
                         log.info("extracted %d files from %s; hid original ZIP at %s",
                                  extracted_count, written_path.name,
                                  hidden.name if hidden else "(unchanged)")
+                # Patrick 2026-07-11 — surveillance exporters ship videos in
+                # containers AVPlayer refuses (AVI etc.); convert on landing
+                # so the Portal always gets a playable file. Original is
+                # dot-prefix-hidden, same audit rule as ZIPs. Fail-soft.
+                elif storage.is_portal_unplayable_video(written_path):
+                    converted = storage.convert_video_to_playable(written_path)
+                    if converted:
+                        log.info("converted %s → %s (Portal-playable)",
+                                 written_path.name, converted.name)
+                        written_path = converted
+                        size_bytes = converted.stat().st_size
             seen.add(fp)
             new_downloads += 1
             manifest_entries[fp] = _manifest_entry(item, written_path, size_bytes)
@@ -678,6 +689,15 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
                         log.info("extracted %d files from %s; hid original ZIP at %s",
                                  extracted_count, written_path.name,
                                  hidden.name if hidden else "(unchanged)")
+                # Patrick 2026-07-11 — convert Portal-unplayable videos on
+                # landing (same pattern as cmd_fetch above). Fail-soft.
+                elif storage.is_portal_unplayable_video(written_path):
+                    converted = storage.convert_video_to_playable(written_path)
+                    if converted:
+                        log.info("converted %s → %s (Portal-playable)",
+                                 written_path.name, converted.name)
+                        written_path = converted
+                        size_bytes = converted.stat().st_size
             seen.add(fp)
             new_downloads += 1
             manifest_entries[fp] = _manifest_entry(item, written_path, size_bytes)

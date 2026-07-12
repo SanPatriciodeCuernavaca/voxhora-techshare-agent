@@ -236,6 +236,106 @@ def hide_zip_after_extract(zip_path: Path) -> Path | None:
         return None
 
 
+# ----- video conversion (Portal playability) -----
+
+# Container/codec wrappers AVFoundation (the Portal's AVPlayer + QuickTime)
+# refuses outright. Surveillance exporters love these. mp4/m4v/mov/3gp are
+# native and never touched.
+PORTAL_UNPLAYABLE_VIDEO_EXTS = {
+    ".avi", ".wmv", ".flv", ".mkv", ".mpg", ".mpeg", ".m2ts", ".mts",
+    ".ts", ".vob", ".asf", ".webm", ".divx", ".3g2",
+}
+
+
+def is_portal_unplayable_video(path: Path) -> bool:
+    return path.suffix.lower() in PORTAL_UNPLAYABLE_VIDEO_EXTS
+
+
+def find_ffmpeg() -> str | None:
+    """Locate an ffmpeg binary: PATH first, then Homebrew's usual homes,
+    then the static binary bundled by the imageio-ffmpeg wheel (shipped
+    in the agent kit so attorneys' Macs need no Homebrew)."""
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        if os.path.exists(candidate):
+            return candidate
+    try:
+        import imageio_ffmpeg  # lazy — optional dependency
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def convert_video_to_playable(video_path: Path) -> Path | None:
+    """Write a Portal-playable `<name>.mp4` next to a video the Portal's
+    AVPlayer can't open, then dot-prefix-hide the original (bytes
+    preserved for the audit chain, same rule as ZIPs).
+
+    Patrick 2026-07-11 — Damian Jimenez Hernandez's TechShare discovery
+    was 9 store-surveillance AVIs (H.264 inside an AVI wrapper written
+    so nonstandard that even a lossless remux fails); QuickTime and the
+    Portal both refused them. Broad fix per Patrick: EVERY discovery
+    video converts to a viewable format when it lands.
+
+    Encoder ladder (each attempt verified by exit 0 + a real file):
+      1. h264_videotoolbox + aac  — Apple hardware encoder, ~10x faster
+      2. libx264 + aac            — always present in bundled ffmpeg
+      3. libx264, audio dropped   — salvages video when audio is corrupt
+    Never raises; on total failure the original stays visible and the
+    caller just logs (a bad video must not fail the fetch item).
+    Returns the .mp4 path, or None.
+    """
+    if not is_portal_unplayable_video(video_path):
+        return None
+    target = video_path.with_suffix(".mp4")
+    if target.exists():
+        return target  # prior fetch already converted (idempotent re-runs)
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None:
+        log.warning("no ffmpeg available; %s stays unconverted", video_path.name)
+        return None
+    import subprocess  # lazy — only this path needs it
+
+    base = [ffmpeg, "-y", "-v", "error", "-err_detect", "ignore_err",
+            "-fflags", "+genpts", "-i", str(video_path)]
+    tail = ["-movflags", "+faststart", str(target)]
+    attempts = [
+        ["-c:v", "h264_videotoolbox", "-b:v", "6M", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+        ["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+        ["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p", "-an"],
+    ]
+    size_mb = max(1, video_path.stat().st_size // (1024 * 1024))
+    timeout_s = min(3600, max(300, size_mb * 6))
+    for codec_args in attempts:
+        try:
+            result = subprocess.run(
+                base + codec_args + tail,
+                capture_output=True, timeout=timeout_s,
+            )
+            if result.returncode == 0 and target.exists() and target.stat().st_size > 1024:
+                break
+        except subprocess.TimeoutExpired:
+            log.warning("conversion timed out (%ss) for %s", timeout_s, video_path.name)
+        except Exception as e:
+            log.warning("conversion attempt errored for %s: %s", video_path.name, e)
+        target.unlink(missing_ok=True)
+    else:
+        log.warning("all conversion attempts failed for %s; original left visible",
+                    video_path.name)
+        return None
+    # Hide the original so the grid shows ONE playable file (audit keeps bytes).
+    hidden = video_path.parent / f".{video_path.name}"
+    try:
+        if not hidden.exists():
+            video_path.rename(hidden)
+    except Exception as e:
+        log.warning("couldn't hide original %s after convert: %s", video_path.name, e)
+    return target
+
+
 def case_discovery_target_path(
     item: DMEItem,
     cause_number: str,
