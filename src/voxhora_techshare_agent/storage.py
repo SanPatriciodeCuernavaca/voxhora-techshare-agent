@@ -387,6 +387,171 @@ def _safe_unlink(p: Path) -> None:
         pass
 
 
+# ----- audio conversion (Portal playability) -----
+
+# Audio containers/codecs the Portal's transport (AVFoundation-backed) can't
+# open. mp3/m4a/aac/aiff/caf and PCM wav are native and never touched. NOTE:
+# .wav is intentionally NOT in this set — a .wav may be PCM (plays) or non-PCM
+# (adpcm_*/gsm/wmav, doesn't); it's decided by a codec probe, not the
+# extension (see is_portal_audio_candidate / _wav_needs_transcode).
+PORTAL_UNPLAYABLE_AUDIO_EXTS = {
+    ".wma", ".ogg", ".oga", ".opus", ".amr", ".ra", ".rm",
+    ".wv", ".ape", ".ac3", ".dts",
+}
+
+
+def find_ffprobe() -> str | None:
+    """Locate ffprobe: PATH, then Homebrew. The imageio-ffmpeg wheel ships
+    ffmpeg but NOT ffprobe, so callers MUST tolerate None and fall back to
+    parsing `ffmpeg -i` stderr (that's Matt's no-Homebrew Mac)."""
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe"):
+        if os.path.exists(candidate):
+            return candidate
+    ff = find_ffmpeg()
+    if ff:
+        sib = Path(ff).with_name("ffprobe")
+        if sib.exists():
+            return str(sib)
+    return None
+
+
+def _probe_first_audio_codec(path: Path) -> str | None:
+    """Lower-case codec name of the first audio stream, or None if it can't
+    be determined. Prefers ffprobe; falls back to parsing `ffmpeg -i` stderr
+    on Homebrew-less Macs (the bundled ffmpeg ships no ffprobe)."""
+    import subprocess  # lazy
+    try:
+        probe = find_ffprobe()
+        if probe:
+            r = subprocess.run(
+                [probe, "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            out = (r.stdout or "").strip().splitlines()
+            return out[0].strip().lower() if out and out[0].strip() else None
+        ff = find_ffmpeg()
+        if not ff:
+            return None
+        r = subprocess.run([ff, "-hide_banner", "-i", str(path)],
+                           capture_output=True, text=True, timeout=30)
+        import re as _re
+        m = _re.search(r"Audio:\s*([a-z0-9_]+)", r.stderr or "", _re.IGNORECASE)
+        return m.group(1).lower() if m else None
+    except Exception:
+        return None
+
+
+def _wav_needs_transcode(path: Path) -> bool:
+    """A .wav plays natively ONLY when it's PCM (incl. mulaw/alaw, which
+    CoreAudio handles — all report `pcm_*`). adpcm_*/gsm/wmav wrapped in a
+    .wav do NOT play and need transcode. On an unknowable probe, return
+    False: never lossily re-encode a possibly-good PCM original."""
+    codec = _probe_first_audio_codec(path)
+    if codec is None:
+        return False
+    return not codec.startswith("pcm_")
+
+
+def is_portal_audio_candidate(path: Path) -> bool:
+    """O(1) dispatch gate for the audio-conversion path (no probe). True for
+    always-unplayable audio containers AND for .wav (a .wav MAY be non-PCM;
+    convert_audio_to_playable runs the one codec probe and leaves PCM wav
+    untouched)."""
+    ext = path.suffix.lower()
+    return ext in PORTAL_UNPLAYABLE_AUDIO_EXTS or ext == ".wav"
+
+
+def convert_audio_to_playable(audio_path: Path) -> Path | None:
+    """Write a Portal-playable `<name>.m4a` (AAC) next to an audio file the
+    Portal's transport can't open, then dot-prefix-hide the original — the
+    same faithful-conversion + audit rule as convert_video_to_playable/ZIPs.
+
+    2026-07-11 — Richardson's discovery shipped 7 jail-call `.wma` (wmav2 in
+    ASF) + 2 `.wav` (MS-ADPCM); neither plays in the Portal. `.wma` is always
+    non-PCM; a `.wav` is transcoded ONLY when a cheap codec probe shows it's
+    not `pcm_*` (PCM wav already plays — re-encoding it would degrade
+    evidence). Mirrors the video converter's hardening exactly: atomic temp +
+    os.replace, never adopt an unrelated same-stem `.m4a`, one shared
+    wall-clock deadline, fully guarded (a bad audio file never fails the
+    fetch item), redundant-original dedup. Returns the `.m4a` path, or None.
+    """
+    try:
+        ext = audio_path.suffix.lower()
+        if ext == ".wav":
+            if not _wav_needs_transcode(audio_path):
+                return None  # PCM wav already plays — leave it untouched
+        elif ext not in PORTAL_UNPLAYABLE_AUDIO_EXTS:
+            return None
+        target = audio_path.with_suffix(".m4a")
+        if target.exists():
+            # Could be an unrelated same-stem native .m4a — never adopt/clobber.
+            log.warning("a %s already exists next to %s — leaving original "
+                        "unconverted to avoid adopting unrelated bytes",
+                        target.name, audio_path.name)
+            return None
+        ffmpeg = find_ffmpeg()
+        if ffmpeg is None:
+            log.warning("no ffmpeg available; %s stays unconverted", audio_path.name)
+            return None
+        import subprocess  # lazy
+        tmp = target.with_name(f".{target.name}.converting")
+        base = [ffmpeg, "-y", "-v", "error", "-err_detect", "ignore_err",
+                "-i", str(audio_path)]
+        # `-vn` drops any embedded cover-art/still stream (ASF/wma carry them);
+        # `-f ipod` forces the m4a/AAC muxer since the `.converting` temp path
+        # can't be inferred from its extension (same reason video uses -f mp4).
+        tail = ["-vn", "-movflags", "+faststart", "-f", "ipod", str(tmp)]
+        attempts = [
+            ["-c:a", "aac_at", "-b:a", "192k"],  # Apple AudioToolbox AAC (macOS)
+            ["-c:a", "aac", "-b:a", "192k"],     # built-in FFmpeg AAC — always present
+        ]
+        size_mb = max(1, audio_path.stat().st_size // (1024 * 1024))
+        deadline = min(1800, max(120, size_mb * 4))  # shared across the ladder
+        import time
+        started = time.monotonic()
+        ok = False
+        for codec_args in attempts:
+            remaining = deadline - (time.monotonic() - started)
+            if remaining <= 0:
+                log.warning("audio conversion deadline (%ss) exhausted for %s",
+                            deadline, audio_path.name)
+                break
+            try:
+                result = subprocess.run(base + codec_args + tail,
+                                        capture_output=True, timeout=remaining)
+                if result.returncode == 0 and tmp.exists() and tmp.stat().st_size > 512:
+                    ok = True
+                    break
+            except subprocess.TimeoutExpired:
+                log.warning("audio conversion timed out for %s", audio_path.name)
+            except Exception as e:
+                log.warning("audio conversion attempt errored for %s: %s", audio_path.name, e)
+            _safe_unlink(tmp)
+        if not ok:
+            _safe_unlink(tmp)
+            log.warning("all audio conversion attempts failed for %s; original left visible",
+                        audio_path.name)
+            return None
+        os.replace(tmp, target)
+        hidden = audio_path.parent / f".{audio_path.name}"
+        try:
+            if hidden.exists():
+                _safe_unlink(audio_path)  # redundant re-download; keep the hidden original
+            else:
+                audio_path.rename(hidden)
+        except Exception as e:
+            log.warning("couldn't hide original %s after convert: %s", audio_path.name, e)
+        return target
+    except Exception as e:  # fail-soft: a bad audio file must never fail the fetch item
+        log.warning("audio conversion crashed for %s: %s",
+                    getattr(audio_path, "name", audio_path), e)
+        return None
+
+
 def case_discovery_target_path(
     item: DMEItem,
     cause_number: str,

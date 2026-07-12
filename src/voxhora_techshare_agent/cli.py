@@ -561,6 +561,16 @@ def cmd_fetch(args: argparse.Namespace) -> int:
                                  written_path.name, converted.name)
                         written_path = converted
                         size_bytes = converted.stat().st_size
+                # Patrick 2026-07-11 — Portal-unplayable AUDIO (wma; non-PCM
+                # wav) → faithful .m4a on landing, original dot-hidden (same
+                # audit rule as video/ZIP). PCM wav is left untouched. Fail-soft.
+                elif storage.is_portal_audio_candidate(written_path):
+                    converted = storage.convert_audio_to_playable(written_path)
+                    if converted:
+                        log.info("converted %s → %s (Portal-playable audio)",
+                                 written_path.name, converted.name)
+                        written_path = converted
+                        size_bytes = converted.stat().st_size
             seen.add(fp)
             new_downloads += 1
             manifest_entries[fp] = _manifest_entry(item, written_path, size_bytes)
@@ -655,16 +665,21 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
         if fp in seen:
             log.info("skip (already-seen): %s", item.name)
             # Still surface in manifest so the Portal sees the existing on-disk
-            # state. A video landed as .avi may have been converted to .mp4 on
-            # a prior run (the .avi is then dot-hidden), so fall back to the
-            # converted sibling when the original name is gone.
+            # state. A prior run may have converted + hidden the original —
+            # video → .mp4, audio → .m4a — so fall back to the converted
+            # sibling when the original name is gone.
             existing_path = storage.case_discovery_target_path(
                 item, cause_number, target_dir=target_dir
             )
-            if not existing_path.exists() and storage.is_portal_unplayable_video(existing_path):
-                converted = existing_path.with_suffix(".mp4")
-                if converted.exists():
-                    existing_path = converted
+            if not existing_path.exists():
+                if storage.is_portal_unplayable_video(existing_path):
+                    sib = existing_path.with_suffix(".mp4")
+                    if sib.exists():
+                        existing_path = sib
+                elif storage.is_portal_audio_candidate(existing_path):
+                    sib = existing_path.with_suffix(".m4a")
+                    if sib.exists():
+                        existing_path = sib
             if existing_path.exists():
                 manifest_entries[fp] = _manifest_entry(item, existing_path, existing_path.stat().st_size)
             continue
@@ -702,6 +717,16 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
                     converted = storage.convert_video_to_playable(written_path)
                     if converted:
                         log.info("converted %s → %s (Portal-playable)",
+                                 written_path.name, converted.name)
+                        written_path = converted
+                        size_bytes = converted.stat().st_size
+                # Patrick 2026-07-11 — Portal-unplayable AUDIO (wma; non-PCM
+                # wav) → faithful .m4a on landing, original dot-hidden (same
+                # audit rule as video/ZIP). PCM wav is left untouched. Fail-soft.
+                elif storage.is_portal_audio_candidate(written_path):
+                    converted = storage.convert_audio_to_playable(written_path)
+                    if converted:
+                        log.info("converted %s → %s (Portal-playable audio)",
                                  written_path.name, converted.name)
                         written_path = converted
                         size_bytes = converted.stat().st_size

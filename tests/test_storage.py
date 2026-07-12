@@ -255,3 +255,100 @@ def test_convert_leaves_no_partial_at_target_on_total_failure(tmp_path):
     assert not (tmp_path / "broken.mp4").exists()
     assert not (tmp_path / ".broken.mp4.converting").exists()
     assert bogus.exists()
+
+
+# ------------------------------- audio → Portal-playable m4a (2026-07-11)
+
+from voxhora_techshare_agent.storage import (
+    convert_audio_to_playable,
+    is_portal_audio_candidate,
+    _wav_needs_transcode,
+)
+
+
+def _make_audio(ff, path, codec, extra=None):
+    import subprocess
+    cmd = [ff, "-y", "-v", "error", "-f", "lavfi", "-i",
+           "sine=frequency=440:duration=1"]
+    if extra:
+        cmd += extra
+    cmd += ["-c:a", codec, str(path)]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def test_audio_candidate_dispatch():
+    assert is_portal_audio_candidate(Path("call.wma"))
+    assert is_portal_audio_candidate(Path("CALL.WMA"))
+    assert is_portal_audio_candidate(Path("note.wav"))       # wav always a candidate (probe decides)
+    assert not is_portal_audio_candidate(Path("song.mp3"))    # natively playable
+    assert not is_portal_audio_candidate(Path("clip.m4a"))
+    assert not is_portal_audio_candidate(Path("doc.pdf"))
+
+
+def test_wma_converts_to_m4a_and_hides_original(tmp_path):
+    ff = find_ffmpeg()
+    if ff is None:
+        pytest.skip("no ffmpeg")
+    src = tmp_path / "jailcall.wma"
+    _make_audio(ff, src, "wmav2")
+    out = convert_audio_to_playable(src)
+    assert out is not None and out.name == "jailcall.m4a"
+    assert out.stat().st_size > 512
+    assert not src.exists()                          # original hidden…
+    assert (tmp_path / ".jailcall.wma").exists()     # …bytes preserved
+    # verify it's really AAC
+    import subprocess
+    r = subprocess.run([ff, "-hide_banner", "-i", str(out)], capture_output=True, text=True)
+    assert "aac" in r.stderr.lower()
+
+
+def test_pcm_wav_left_untouched(tmp_path):
+    ff = find_ffmpeg()
+    if ff is None:
+        pytest.skip("no ffmpeg")
+    src = tmp_path / "clean.wav"
+    _make_audio(ff, src, "pcm_s16le")
+    assert _wav_needs_transcode(src) is False        # PCM → no transcode
+    out = convert_audio_to_playable(src)
+    assert out is None                               # left alone
+    assert src.exists()
+    assert not (tmp_path / "clean.m4a").exists()
+
+
+def test_nonpcm_wav_transcodes(tmp_path):
+    ff = find_ffmpeg()
+    if ff is None:
+        pytest.skip("no ffmpeg")
+    src = tmp_path / "note.wav"
+    _make_audio(ff, src, "adpcm_ms")                 # non-PCM inside a .wav
+    assert _wav_needs_transcode(src) is True
+    out = convert_audio_to_playable(src)
+    assert out is not None and out.name == "note.m4a"
+    assert not src.exists()
+    assert (tmp_path / ".note.wav").exists()
+
+
+def test_audio_wont_adopt_unrelated_sibling_m4a(tmp_path):
+    ff = find_ffmpeg()
+    if ff is None:
+        pytest.skip("no ffmpeg")
+    src = tmp_path / "rec.wma"
+    _make_audio(ff, src, "wmav2")
+    unrelated = tmp_path / "rec.m4a"
+    unrelated.write_bytes(b"a different recording's native m4a")
+    out = convert_audio_to_playable(src)
+    assert out is None                               # did not adopt
+    assert unrelated.read_bytes() == b"a different recording's native m4a"
+    assert src.exists()                              # original NOT hidden
+    assert not (tmp_path / ".rec.wma").exists()
+
+
+def test_audio_failsoft_on_garbage(tmp_path):
+    if find_ffmpeg() is None:
+        pytest.skip("no ffmpeg")
+    bogus = tmp_path / "broken.wma"
+    bogus.write_bytes(b"not actually a wma stream" * 40)
+    assert convert_audio_to_playable(bogus) is None
+    assert bogus.exists()
+    assert not (tmp_path / "broken.m4a").exists()
+    assert not (tmp_path / ".broken.m4a.converting").exists()
