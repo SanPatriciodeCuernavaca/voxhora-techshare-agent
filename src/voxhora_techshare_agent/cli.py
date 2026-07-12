@@ -654,10 +654,17 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
         fp = storage.dme_fingerprint(item)
         if fp in seen:
             log.info("skip (already-seen): %s", item.name)
-            # Still surface in manifest so the Portal sees the existing on-disk state
+            # Still surface in manifest so the Portal sees the existing on-disk
+            # state. A video landed as .avi may have been converted to .mp4 on
+            # a prior run (the .avi is then dot-hidden), so fall back to the
+            # converted sibling when the original name is gone.
             existing_path = storage.case_discovery_target_path(
                 item, cause_number, target_dir=target_dir
             )
+            if not existing_path.exists() and storage.is_portal_unplayable_video(existing_path):
+                converted = existing_path.with_suffix(".mp4")
+                if converted.exists():
+                    existing_path = converted
             if existing_path.exists():
                 manifest_entries[fp] = _manifest_entry(item, existing_path, existing_path.stat().st_size)
             continue

@@ -287,53 +287,104 @@ def convert_video_to_playable(video_path: Path) -> Path | None:
     Never raises; on total failure the original stays visible and the
     caller just logs (a bad video must not fail the fetch item).
     Returns the .mp4 path, or None.
-    """
-    if not is_portal_unplayable_video(video_path):
-        return None
-    target = video_path.with_suffix(".mp4")
-    if target.exists():
-        return target  # prior fetch already converted (idempotent re-runs)
-    ffmpeg = find_ffmpeg()
-    if ffmpeg is None:
-        log.warning("no ffmpeg available; %s stays unconverted", video_path.name)
-        return None
-    import subprocess  # lazy — only this path needs it
 
-    base = [ffmpeg, "-y", "-v", "error", "-err_detect", "ignore_err",
-            "-fflags", "+genpts", "-i", str(video_path)]
-    tail = ["-movflags", "+faststart", str(target)]
-    attempts = [
-        ["-c:v", "h264_videotoolbox", "-b:v", "6M", "-pix_fmt", "yuv420p", "-c:a", "aac"],
-        ["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac"],
-        ["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p", "-an"],
-    ]
-    size_mb = max(1, video_path.stat().st_size // (1024 * 1024))
-    timeout_s = min(3600, max(300, size_mb * 6))
-    for codec_args in attempts:
-        try:
-            result = subprocess.run(
-                base + codec_args + tail,
-                capture_output=True, timeout=timeout_s,
-            )
-            if result.returncode == 0 and target.exists() and target.stat().st_size > 1024:
-                break
-        except subprocess.TimeoutExpired:
-            log.warning("conversion timed out (%ss) for %s", timeout_s, video_path.name)
-        except Exception as e:
-            log.warning("conversion attempt errored for %s: %s", video_path.name, e)
-        target.unlink(missing_ok=True)
-    else:
-        log.warning("all conversion attempts failed for %s; original left visible",
-                    video_path.name)
-        return None
-    # Hide the original so the grid shows ONE playable file (audit keeps bytes).
-    hidden = video_path.parent / f".{video_path.name}"
+    Evidence-integrity rules (hardened 2026-07-11 after adversarial review):
+    - Encode to a unique temp in the same dir, then os.replace into place —
+      a killed encode never leaves a half-written `<name>.mp4` that a later
+      run would trust as finished.
+    - Do NOT adopt a pre-existing `<stem>.mp4` sibling as our output. The
+      seen-set is the real cross-run idempotency guard; a sibling mp4 that's
+      already here for a fresh item is an UNRELATED file (different camera),
+      so we must never rename its neighbour away or point the manifest at
+      its bytes. Leave the original visible and bail.
+    - One shared wall-clock deadline across the whole ladder, so a
+      pathological video can't stall the single-threaded fetch for 3×timeout.
+    - The whole body is guarded: nothing escapes to fail the fetch item.
+    """
     try:
-        if not hidden.exists():
-            video_path.rename(hidden)
-    except Exception as e:
-        log.warning("couldn't hide original %s after convert: %s", video_path.name, e)
-    return target
+        if not is_portal_unplayable_video(video_path):
+            return None
+        target = video_path.with_suffix(".mp4")
+        if target.exists():
+            # Not necessarily ours — could be an unrelated same-stem native
+            # file from another camera. Never clobber/adopt it: leave the
+            # original visible and unconverted (rare; evidence preserved).
+            log.warning("a %s already exists next to %s — leaving original "
+                        "unconverted to avoid adopting unrelated bytes",
+                        target.name, video_path.name)
+            return None
+        ffmpeg = find_ffmpeg()
+        if ffmpeg is None:
+            log.warning("no ffmpeg available; %s stays unconverted", video_path.name)
+            return None
+        import subprocess  # lazy — only this path needs it
+
+        tmp = target.with_name(f".{target.name}.converting")
+        base = [ffmpeg, "-y", "-v", "error", "-err_detect", "ignore_err",
+                "-fflags", "+genpts", "-i", str(video_path)]
+        # `-f mp4` is REQUIRED: the temp path ends in `.converting`, so ffmpeg
+        # can't infer the muxer from the extension the way it could for a
+        # literal `.mp4` output.
+        tail = ["-movflags", "+faststart", "-f", "mp4", str(tmp)]
+        attempts = [
+            ["-c:v", "h264_videotoolbox", "-b:v", "6M", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+            ["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+            ["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p", "-an"],
+        ]
+        size_mb = max(1, video_path.stat().st_size // (1024 * 1024))
+        deadline = min(3600, max(300, size_mb * 6))  # shared across the ladder
+        import time
+        started = time.monotonic()
+        ok = False
+        for codec_args in attempts:
+            remaining = deadline - (time.monotonic() - started)
+            if remaining <= 0:
+                log.warning("conversion deadline (%ss) exhausted for %s",
+                            deadline, video_path.name)
+                break
+            try:
+                result = subprocess.run(
+                    base + codec_args + tail,
+                    capture_output=True, timeout=remaining,
+                )
+                if result.returncode == 0 and tmp.exists() and tmp.stat().st_size > 1024:
+                    ok = True
+                    break
+            except subprocess.TimeoutExpired:
+                log.warning("conversion timed out for %s", video_path.name)
+            except Exception as e:
+                log.warning("conversion attempt errored for %s: %s", video_path.name, e)
+            _safe_unlink(tmp)
+        if not ok:
+            _safe_unlink(tmp)
+            log.warning("all conversion attempts failed for %s; original left visible",
+                        video_path.name)
+            return None
+        # Atomically place the finished mp4, then hide the original so the
+        # grid shows ONE playable file (audit keeps the original bytes).
+        os.replace(tmp, target)
+        hidden = video_path.parent / f".{video_path.name}"
+        try:
+            if hidden.exists():
+                # A hidden original from a prior run is already preserved —
+                # remove the redundant re-downloaded visible copy (mirrors
+                # hide_zip_after_extract's audit-safe dedup).
+                _safe_unlink(video_path)
+            else:
+                video_path.rename(hidden)
+        except Exception as e:
+            log.warning("couldn't hide original %s after convert: %s", video_path.name, e)
+        return target
+    except Exception as e:  # fail-soft: a bad video must never fail the fetch item
+        log.warning("video conversion crashed for %s: %s", getattr(video_path, "name", video_path), e)
+        return None
+
+
+def _safe_unlink(p: Path) -> None:
+    try:
+        p.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def case_discovery_target_path(

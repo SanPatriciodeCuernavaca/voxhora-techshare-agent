@@ -209,14 +209,49 @@ def test_convert_garbage_leaves_original_visible(tmp_path):
     assert not (tmp_path / "corrupt.mp4").exists()
 
 
-def test_convert_idempotent_when_mp4_exists(tmp_path):
-    """Re-fetch of an already-converted item returns the existing mp4
-    without touching anything (seen-set crash-resume path)."""
+def test_convert_wont_adopt_unrelated_sibling_mp4(tmp_path):
+    """A pre-existing <stem>.mp4 may be an UNRELATED native file from another
+    camera. Never adopt its bytes or hide our .avi against it — leave the
+    original visible and bail (evidence integrity over convenience)."""
     src = tmp_path / "cam.avi"
     src.write_bytes(b"RIFF whatever")
-    existing = tmp_path / "cam.mp4"
-    existing.write_bytes(b"converted earlier")
+    unrelated = tmp_path / "cam.mp4"
+    unrelated.write_bytes(b"a different camera's native file")
     out = convert_video_to_playable(src)
-    assert out == existing
-    assert existing.read_bytes() == b"converted earlier"
-    assert src.exists()  # this call didn't convert, so it didn't hide
+    assert out is None                                                 # did not adopt
+    assert unrelated.read_bytes() == b"a different camera's native file"  # untouched
+    assert src.exists()                                                # original NOT hidden
+    assert not (tmp_path / ".cam.avi").exists()
+
+
+def test_convert_removes_redundant_redownloaded_original(tmp_path):
+    """After a successful convert, if a hidden original already exists (prior
+    run) the freshly re-downloaded visible copy is removed, not left as a
+    second dead row — ZIP-path parity, audit bytes kept in the hidden copy."""
+    ff = find_ffmpeg()
+    if ff is None:
+        pytest.skip("no ffmpeg on this machine")
+    import subprocess
+    src = tmp_path / "cam.avi"
+    subprocess.run([ff, "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc=duration=1:size=160x120:rate=8", str(src)],
+                   check=True, capture_output=True)
+    (tmp_path / ".cam.avi").write_bytes(b"preserved original from prior run")
+    out = convert_video_to_playable(src)
+    assert out is not None and out.name == "cam.mp4"
+    assert not src.exists()                                            # redundant copy removed
+    assert (tmp_path / ".cam.avi").read_bytes() == b"preserved original from prior run"
+
+
+def test_convert_leaves_no_partial_at_target_on_total_failure(tmp_path):
+    """A corrupt input leaves NO cam.mp4 (not even a partial), so a later run
+    never trusts a half-written file as finished. The .converting temp is
+    cleaned too."""
+    if find_ffmpeg() is None:
+        pytest.skip("no ffmpeg on this machine")
+    bogus = tmp_path / "broken.avi"
+    bogus.write_bytes(b"RIFF definitely not a real video payload" * 50)
+    assert convert_video_to_playable(bogus) is None
+    assert not (tmp_path / "broken.mp4").exists()
+    assert not (tmp_path / ".broken.mp4.converting").exists()
+    assert bogus.exists()
