@@ -352,3 +352,44 @@ def test_audio_failsoft_on_garbage(tmp_path):
     assert bogus.exists()
     assert not (tmp_path / "broken.m4a").exists()
     assert not (tmp_path / ".broken.m4a.converting").exists()
+
+
+# --- PC affidavit re-fetch (2026-07-27) -------------------------------------
+#
+# The repair of the 87 cases whose stored PC is Voxhora's own text rendering
+# rather than the county's PDF has TWO gates in its way: the seen-set in
+# cli._refresh_one_case, and this one. Without force, a re-fetch downloads
+# the real PC and then silently throws it away because a PDF for that cause
+# is still sitting in the inbox.
+
+
+class _FakeItem:
+    name = "PC Affidavit.pdf"
+
+
+def test_write_pc_affidavit_skips_existing_by_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "dropbox_inbox", lambda: tmp_path)
+    (tmp_path / "C1CR26204167.pdf").write_bytes(b"the-old-drop")
+
+    storage.write_pc_affidavit(_FakeItem(), b"the-county-pdf", "C1CR26204167")
+
+    assert (tmp_path / "C1CR26204167.pdf").read_bytes() == b"the-old-drop"
+
+
+def test_write_pc_affidavit_force_overwrites(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "dropbox_inbox", lambda: tmp_path)
+    (tmp_path / "C1CR26204167.pdf").write_bytes(b"the-old-drop")
+
+    storage.write_pc_affidavit(
+        _FakeItem(), b"the-county-pdf", "C1CR26204167", force=True
+    )
+
+    assert (tmp_path / "C1CR26204167.pdf").read_bytes() == b"the-county-pdf"
+
+
+def test_write_pc_affidavit_writes_when_absent(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "dropbox_inbox", lambda: tmp_path)
+
+    out = storage.write_pc_affidavit(_FakeItem(), b"the-county-pdf", "C1CR26204167")
+
+    assert out.read_bytes() == b"the-county-pdf"

@@ -82,20 +82,30 @@ def dme_fingerprint(item: DMEItem) -> str:
 # ----- file outputs -----
 
 
-def write_pc_affidavit(item: DMEItem, content: bytes, cause_number: str) -> Path:
+def write_pc_affidavit(
+    item: DMEItem, content: bytes, cause_number: str, force: bool = False
+) -> Path:
     """Write a PC Affidavit PDF into Voxhora's Bulk_Inbox for AutoIntakeWatcher.
 
     Filename convention: <cause-number>.pdf (if not already named that way)
     Voxhora's existing AutoIntakeWatcher matches D1DC*/C1CR* patterns; the
     cause-number-named file ensures the pipeline attributes to the right case.
+
+    `force` overwrites a PDF already sitting in the inbox. Without it a
+    --force-pc re-fetch is a silent no-op whenever the previous drop is
+    still on disk: the bytes are downloaded and then thrown away here. That
+    is the SECOND gate on the same repair (the first being the seen-set),
+    and both have to open for the 87 stand-in cases to get their real PC.
     """
     inbox = config.dropbox_inbox()
     target = inbox / f"{cause_number}.pdf"
     # If the file already exists, don't overwrite — TechShare may re-share
     # an identical PC; leave the original timestamp/processing intact.
-    if target.exists():
+    if target.exists() and not force:
         log.info("PC %s already on disk; skipping write", target.name)
         return target
+    if target.exists():
+        log.info("PC %s already on disk; overwriting (force)", target.name)
     atomic_write_bytes(target, content)
     log.info("wrote PC affidavit: %s (%d bytes)", target, len(content))
     return target

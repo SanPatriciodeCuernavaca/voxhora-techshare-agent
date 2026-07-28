@@ -104,6 +104,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     rf = sub.add_parser("refresh", help="Light refresh for ONE case — pulls PC affidavit + plea offer only (no videos/audio/other DME). Use this for steady-state agent flows.")
     rf.add_argument("cause_number", help="e.g. C1CR26203830 or D1DC23207931")
+    rf.add_argument(
+        "--force-pc",
+        action="store_true",
+        help="Re-download the PC affidavit even if already in the seen-set. For repairing cases whose stored PC is Voxhora's text rendering rather than the county's PDF.",
+    )
 
     ba = sub.add_parser("backfill-all", help="Light refresh for ALL cases in the cause→UUID cache (PC + plea per case). Use after seeding the cache to populate every existing client.")
     ba.add_argument("--rate-limit-seconds", type=float, default=0.0, help="Seconds to sleep between cases (default 0). Use e.g. 1.0 to spread audit footprint over time.")
@@ -925,13 +930,23 @@ def _write_manifest(
     storage.atomic_write_json(path, payload)
 
 
-def _refresh_one_case(cause_number: str, client: TechShareClient) -> dict:
+def _refresh_one_case(
+    cause_number: str, client: TechShareClient, force_pc: bool = False
+) -> dict:
     """Internal: light refresh of one case — PC affidavit + plea offer only.
 
     Returns {"cause": ..., "pcs_downloaded": int, "plea_captured": bool, "skipped": bool, "error": str|None}
     Does NOT download videos, audio, or other discovery — that's reserved
     for the explicit `fetch` subcommand (invoked via Voxhora-Mac's
     "Download Remaining Discovery" button).
+
+    `force_pc` re-fetches a PC even though its fingerprint is already in the
+    seen-set. Added 2026-07-27 for the repair of the 87 cases whose PC on
+    file is Voxhora's own text rendering rather than the county's document:
+    the county HAS the real PDF, but the seen-set says "already downloaded"
+    and normal runs skip it forever. Deliberately opt-in and PC-only —
+    routine runs keep skipping exactly as before, and nothing here touches
+    video or other DME.
     """
     result = {"cause": cause_number, "pcs_downloaded": 0, "plea_captured": False, "skipped": False, "error": None}
     resolved = _resolve_case(cause_number)
@@ -958,8 +973,10 @@ def _refresh_one_case(cause_number: str, client: TechShareClient) -> dict:
     seen = storage.load_seen_dme_ids()
     for pc in pcs:
         fp = storage.dme_fingerprint(pc)
-        if fp in seen:
+        if fp in seen and not force_pc:
             continue
+        if fp in seen:
+            log.info("re-fetching already-seen PC %s (--force-pc)", pc.name)
         try:
             data = client.download_dme_file(service_id, pc)
         except Exception:
@@ -977,7 +994,7 @@ def _refresh_one_case(cause_number: str, client: TechShareClient) -> dict:
                 result["error"] = f"PC download failed: {e}"
                 break
         try:
-            storage.write_pc_affidavit(pc, data, cause_number)
+            storage.write_pc_affidavit(pc, data, cause_number, force=force_pc)
             seen.add(fp)
             result["pcs_downloaded"] += 1
         except Exception as e:
@@ -1002,7 +1019,7 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     session = TechShareSession()
     session.ensure_authenticated()
     client = TechShareClient(session)
-    r = _refresh_one_case(args.cause_number, client)
+    r = _refresh_one_case(args.cause_number, client, force_pc=getattr(args, "force_pc", False))
     storage.record_run_result(
         mode="refresh",
         cause_number=args.cause_number,
