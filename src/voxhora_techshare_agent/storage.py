@@ -706,9 +706,26 @@ def load_case_cache(username: str | None = None) -> dict[str, dict]:
         return {}
 
 
+def canonical_cause(raw: str) -> str:
+    """Undashed, uppercase — the shape the cause cache is keyed by.
+
+    Causes arrive in two shapes: the county-dashed DSA form
+    "C-1-CR-25-208407" and the agent's "C1CR25208407". Mirrors
+    TechShareBackfillEngine.canonicalCause on the Swift side.
+    """
+    return "".join(ch for ch in raw.upper() if ch.isalnum())
+
+
 def lookup_case(cause_number: str, username: str | None = None) -> dict | None:
-    """Look up a case in the cache. Returns None if not present."""
-    return load_case_cache(username).get(cause_number)
+    """Look up a case in the cache. Returns None if not present.
+
+    2026-07-28 — normalizes first. The cache is keyed by the undashed form, and
+    this was a bare dict .get(), so a dashed cause resolved to "not in cache"
+    even when the case was right there. Patrick hit it on Roberto Ruiz.
+    Falls back to the raw key so any legacy dashed entry still resolves.
+    """
+    cache = load_case_cache(username)
+    return cache.get(canonical_cause(cause_number)) or cache.get(cause_number)
 
 
 def case_cache_stats(username: str | None = None) -> dict:

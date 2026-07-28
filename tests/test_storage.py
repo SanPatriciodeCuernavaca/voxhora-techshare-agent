@@ -393,3 +393,16 @@ def test_write_pc_affidavit_writes_when_absent(monkeypatch, tmp_path):
     out = storage.write_pc_affidavit(_FakeItem(), b"the-county-pdf", "C1CR26204167")
 
     assert out.read_bytes() == b"the-county-pdf"
+
+
+def test_lookup_case_accepts_the_dashed_county_form(monkeypatch, tmp_path):
+    """Patrick's Roberto Ruiz bug: the cache is keyed undashed, the lookup was
+    a bare .get(), so "C-1-CR-25-208407" resolved to "not in cache"."""
+    monkeypatch.setattr(config, "state_dir", lambda username=None: tmp_path)
+    (tmp_path / "case_uuid_cache.json").write_text(
+        '{"C1CR25208407": {"case_uuid": "u", "service_id": "s", "backend_port": 1030}}'
+    )
+    assert storage.lookup_case("C-1-CR-25-208407") is not None
+    assert storage.lookup_case("C1CR25208407") is not None
+    assert storage.lookup_case("c-1-cr-25-208407") is not None
+    assert storage.lookup_case("D1DC99999999") is None
