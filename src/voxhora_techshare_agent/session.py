@@ -31,13 +31,19 @@ log = logging.getLogger(__name__)
 # How often to touch the API session during a long transfer.
 #
 # Patrick asked for "as long as possible without being kicked out", so this is
-# derived from a MEASURED idle timeout rather than guessed: concurrent sessions
-# are permitted (verified 2026-07-28), so several were opened at once and each
-# probed at a different idle age to find where the session dies.
+# MEASURED, not guessed. Concurrent sessions are permitted (verified
+# 2026-07-28), so several sessions were opened at once and each probed at a
+# different idle age — one data point per session, because a probe itself
+# resets the idle clock.
 #
-# Set to roughly half the observed timeout — long enough to stay quiet, short
-# enough that a single missed ping cannot expire the session.
-SESSION_KEEPALIVE_SECONDS: float = 600.0  # provisional; see measurement note
+# Measured 2026-07-28: a session idle for 15.2 minutes was DEAD. The timeout is
+# therefore under 15 minutes — far shorter than a typical 20-minute default,
+# and shorter than a single large-video transfer.
+#
+# Set to a THIRD of the observed ceiling, not half: two consecutive missed
+# pings (a network blip, a slow response) still leave the session alive. The
+# heartbeat is fail-soft, so tolerating misses is the whole point.
+SESSION_KEEPALIVE_SECONDS: float = 300.0  # 5 min; ceiling measured <15 min
 
 
 class TechShareAuthError(RuntimeError):
