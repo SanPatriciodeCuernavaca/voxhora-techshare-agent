@@ -124,12 +124,21 @@ class TechShareClient:
         max_attempts = 3
         backoffs = [3, 8, 0]  # seconds before attempts 2 and 3
         last_err: Exception | None = None
+        # 2026-07-28 — keep the FIRST error. Once a re-login runs, later
+        # attempts can fail for a different (downstream) reason, and reporting
+        # only the last one buried the actual cause: the 07-28 loss surfaced as
+        # "Could not retrieve CSRF token" when the real failure was whatever
+        # killed the session 275 minutes in.
+        first_err: Exception | None = None
+        reauth_err: Exception | None = None
         for attempt in range(max_attempts):
             try:
                 link, auth = self.session.prep_dme_download(service_id, item.enclosure_href)
                 return self.session.prepared_download_to_path(link, auth, target_path)
             except Exception as e:  # transient network/timeout/5xx — retry
                 last_err = e
+                if first_err is None:
+                    first_err = e
                 if attempt < max_attempts - 1:
                     wait = backoffs[attempt]
                     log.warning(
@@ -146,10 +155,21 @@ class TechShareClient:
                     # sails instead of "everything after minute 60 fails".
                     try:
                         self.session.reauthenticate()
+                        reauth_err = None
                     except Exception as auth_err:
+                        # reauthenticate() is non-destructive on failure as of
+                        # 2026-07-28, so the session is no worse than it was —
+                        # but a failed re-login is the single most useful thing
+                        # to report, so carry it into the final error.
+                        reauth_err = auth_err
                         log.warning("mid-run re-login failed: %s", auth_err)
                     if wait:
                         time.sleep(wait)
+        if first_err is not None:
+            detail = f"{type(first_err).__name__}: {first_err}"
+            if reauth_err is not None:
+                detail += f" (mid-run re-login also failed: {reauth_err})"
+            raise RuntimeError(f"download failed for {item.name!r} — {detail}") from first_err
         raise last_err if last_err else RuntimeError(f"download failed for {item.name!r}")
 
     # ----- case search (TBD — schema partial from recon) -----

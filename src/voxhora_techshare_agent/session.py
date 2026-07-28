@@ -558,14 +558,43 @@ class TechShareSession:
         into the new session: the CSRF token, the cached DefensePortalAuth
         value, and any DefensePortalAuth cookies in the jar (otherwise
         _resolve_defense_portal_auth would happily hand back the dead one).
+
+        NON-DESTRUCTIVE ON FAILURE (2026-07-28). The 07-04 version cleared
+        every piece of auth state BEFORE calling login(), so a re-login that
+        itself failed left the session strictly WORSE than it found it — no
+        token, no DPA, purged cookies. The caller only logs that failure as a
+        warning, so the next attempt then died with "Could not retrieve CSRF
+        token", masking the real cause and guaranteeing the remaining retries
+        would fail too. That turned a recoverable blip into a dead session and
+        cost Patrick a body-cam video 275 minutes into a run on 2026-07-28.
+
+        Now the state is snapshotted and restored if login() raises, so a
+        failed re-login leaves the session exactly as it was — no better, but
+        no worse — and the ORIGINAL error propagates instead of a CSRF echo.
         """
         log.info("re-authenticating mid-run (session presumed expired)")
+        saved_token = self._csrf_token
+        saved_dpa = self._dpa_cache
+        saved_cookies = [
+            ck for ck in self._session.cookies if ck.name == "DefensePortalAuth"
+        ]
         self._csrf_token = None
         self._dpa_cache = None
-        stale = [ck for ck in self._session.cookies if ck.name == "DefensePortalAuth"]
-        for ck in stale:
+        for ck in saved_cookies:
             try:
                 self._session.cookies.clear(ck.domain, ck.path, ck.name)
             except KeyError:
                 pass
-        self.login()
+        try:
+            self.login()
+        except Exception:
+            # Put back exactly what we took away, then let the caller see the
+            # real reason the re-login failed.
+            self._csrf_token = saved_token
+            self._dpa_cache = saved_dpa
+            for ck in saved_cookies:
+                try:
+                    self._session.cookies.set_cookie(ck)
+                except Exception:
+                    pass
+            raise

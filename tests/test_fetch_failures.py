@@ -239,3 +239,70 @@ def test_zero_byte_fresh_failure_deletes_partial(tmp_path: Path):
     with pytest.raises(TimeoutError):
         s.prepared_download_to_path("/download?token=t", "auth", target)
     assert not (tmp_path / "video.mp4.partial").exists()
+
+
+# --- Non-destructive re-login (2026-07-28) --------------------------------
+#
+# Patrick lost a body-cam video 275 minutes into a run. The reported error was
+# "Could not retrieve CSRF token; session may be expired" — which is IMPOSSIBLE
+# as a first failure, because csrf_token() short-circuits on a cached token.
+# It can only appear after reauthenticate() nulls that token. The old version
+# cleared the token, the DPA cache and the cookies BEFORE calling login(), so a
+# re-login that itself failed left the session strictly worse than it found it
+# and guaranteed the remaining retries would die too.
+
+import requests
+
+from voxhora_techshare_agent.session import TechShareSession
+
+
+def _session_with_state(monkeypatch, login_raises):
+    s = TechShareSession.__new__(TechShareSession)
+    s._session = requests.Session()
+    s._csrf_token = "TOKEN-FROM-RUN-START"
+    s._dpa_cache = "DPA-FROM-RUN-START"
+    s._session.cookies.set("DefensePortalAuth", "COOKIE-FROM-RUN-START",
+                           domain="attorney.techsharetx.gov", path="/")
+
+    def fake_login():
+        if login_raises:
+            raise RuntimeError("login refused")
+        s._csrf_token = "TOKEN-AFTER-RELOGIN"
+        s._dpa_cache = None
+    s.login = fake_login
+    return s
+
+
+def test_failed_relogin_restores_auth_state(monkeypatch):
+    """The fix. A re-login that fails must leave the session exactly as it was."""
+    s = _session_with_state(monkeypatch, login_raises=True)
+
+    with pytest.raises(RuntimeError, match="login refused"):
+        s.reauthenticate()
+
+    assert s._csrf_token == "TOKEN-FROM-RUN-START", (
+        "A failed re-login must not destroy the cached CSRF token — that is what "
+        "manufactured the misleading 'could not retrieve CSRF token' error."
+    )
+    assert s._dpa_cache == "DPA-FROM-RUN-START"
+    assert s._session.cookies.get(
+        "DefensePortalAuth", domain="attorney.techsharetx.gov", path="/"
+    ) == "COOKIE-FROM-RUN-START"
+
+
+def test_failed_relogin_propagates_the_real_error(monkeypatch):
+    """The original reason must survive, not be swallowed into a warning."""
+    s = _session_with_state(monkeypatch, login_raises=True)
+    with pytest.raises(RuntimeError, match="login refused"):
+        s.reauthenticate()
+
+
+def test_successful_relogin_still_replaces_state(monkeypatch):
+    """The normal path is unchanged — a good re-login still swaps in fresh auth."""
+    s = _session_with_state(monkeypatch, login_raises=False)
+    s.reauthenticate()
+    assert s._csrf_token == "TOKEN-AFTER-RELOGIN"
+    assert s._dpa_cache is None
+    assert s._session.cookies.get(
+        "DefensePortalAuth", domain="attorney.techsharetx.gov", path="/"
+    ) is None, "A successful re-login must still purge the stale DPA cookie."
