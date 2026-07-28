@@ -36,14 +36,22 @@ log = logging.getLogger(__name__)
 # different idle age — one data point per session, because a probe itself
 # resets the idle clock.
 #
-# Measured 2026-07-28: a session idle for 15.2 minutes was DEAD. The timeout is
-# therefore under 15 minutes — far shorter than a typical 20-minute default,
-# and shorter than a single large-video transfer.
+# Measured 2026-07-28, two sweeps:
+#     idle 15.2 min -> DEAD        (coarse sweep)
+#     idle  4.0 min -> ALIVE       (fine sweep)
+#     idle  6.3 min -> DEAD        (fine sweep — but this probe also hit a
+#                                   15 s read timeout, so it may reflect a
+#                                   network hiccup rather than true expiry)
 #
-# Set to a THIRD of the observed ceiling, not half: two consecutive missed
-# pings (a network blip, a slow response) still leave the session alive. The
-# heartbeat is fail-soft, so tolerating misses is the whole point.
-SESSION_KEEPALIVE_SECONDS: float = 300.0  # 5 min; ceiling measured <15 min
+# So the ceiling is somewhere between 4 and 6.3 minutes — DRAMATICALLY shorter
+# than the 20-minute default one would assume, and shorter than a single large
+# video transfer. The only value confirmed ALIVE is 4.0 minutes.
+#
+# Set to 120s: comfortably under the only confirmed-alive point, so two
+# consecutive missed pings still land inside it. The heartbeat is fail-soft, so
+# tolerating misses is the point. Erring short costs one cheap GET every two
+# minutes; erring long costs a multi-GB download hours in.
+SESSION_KEEPALIVE_SECONDS: float = 120.0  # 2 min; only 4.0 min was proven alive
 
 
 class TechShareAuthError(RuntimeError):
