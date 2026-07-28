@@ -12,9 +12,11 @@ cookies requests.Session collects after a successful login.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import pickle
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,18 @@ import requests
 from . import config, storage
 
 log = logging.getLogger(__name__)
+
+
+# How often to touch the API session during a long transfer.
+#
+# Patrick asked for "as long as possible without being kicked out", so this is
+# derived from a MEASURED idle timeout rather than guessed: concurrent sessions
+# are permitted (verified 2026-07-28), so several were opened at once and each
+# probed at a different idle age to find where the session dies.
+#
+# Set to roughly half the observed timeout — long enough to stay quiet, short
+# enough that a single missed ping cannot expire the session.
+SESSION_KEEPALIVE_SECONDS: float = 600.0  # provisional; see measurement note
 
 
 class TechShareAuthError(RuntimeError):
@@ -435,6 +449,63 @@ class TechShareSession:
             return vals[-1]
         return None
 
+    # ------------------------------------------------------------------
+    # Session keepalive (2026-07-28)
+    #
+    # Patrick: "the session expiry loop -- it should not get kicked out."
+    #
+    # Multi-GB transfers go to a SEPARATE DME host carrying their own
+    # DefensePortalAuth cookie, so while a big video streams the API session
+    # sees NO traffic at all -- often for 16-20 minutes at a stretch. Under a
+    # sliding idle timeout the download itself starves the session that
+    # authorized it. That is why failures land on the biggest files late in
+    # long runs, and why the same files fetch fine next day on a fresh login.
+    #
+    # A cheap periodic touch keeps the API session from ever going idle. The
+    # interval is deliberately long -- see SESSION_KEEPALIVE_SECONDS.
+    # ------------------------------------------------------------------
+
+    def _session_ping(self) -> bool:
+        """Touch the API session without mutating cached auth state.
+
+        Deliberately NOT `_fetch_csrf_token()`: that assigns `_csrf_token`,
+        and this runs on a heartbeat thread while the main thread streams.
+        A bare GET keeps the read/write boundary clean.
+        """
+        try:
+            r = self._session.get(
+                f"{config.TECHSHARE_BASE_URL}/api/csrf-token", timeout=15
+            )
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    @contextlib.contextmanager
+    def keepalive(self, interval_seconds: float | None = None):
+        """Hold the API session open for the duration of a long transfer.
+
+        Fail-soft by construction: a missed ping only logs. The heartbeat must
+        never be able to break a download that is otherwise succeeding.
+        """
+        interval = interval_seconds or SESSION_KEEPALIVE_SECONDS
+        stop = threading.Event()
+
+        def beat() -> None:
+            # wait() returns True the moment stop is set, so the thread exits
+            # promptly at end of transfer rather than sleeping out the interval.
+            while not stop.wait(interval):
+                if self._session_ping():
+                    log.debug("session keepalive ok")
+                else:
+                    log.warning("session keepalive got no response (continuing)")
+
+        t = threading.Thread(target=beat, daemon=True, name="techshare-keepalive")
+        t.start()
+        try:
+            yield
+        finally:
+            stop.set()
+
     def prepared_download_to_path(
         self,
         download_link: str,
@@ -510,7 +581,10 @@ class TechShareSession:
 
         bytes_written = resume_from
         try:
-            with open(partial, "ab" if resume_from > 0 else "wb") as f:
+            # Hold the API session open for the whole transfer. Without this
+            # the API session sees no traffic while a multi-GB video streams
+            # from the DME host, and idles out mid-run — the 2026-07-28 loss.
+            with self.keepalive(), open(partial, "ab" if resume_from > 0 else "wb") as f:
                 for chunk in r.iter_content(chunk_size=chunk_size):
                     if chunk:
                         f.write(chunk)

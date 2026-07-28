@@ -5,6 +5,7 @@ manifest failed_items), and mid-run re-authentication on retry."""
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -306,3 +307,76 @@ def test_successful_relogin_still_replaces_state(monkeypatch):
     assert s._session.cookies.get(
         "DefensePortalAuth", domain="attorney.techsharetx.gov", path="/"
     ) is None, "A successful re-login must still purge the stale DPA cookie."
+
+
+# --- Session keepalive (2026-07-28) ---------------------------------------
+#
+# Multi-GB transfers stream from a separate DME host, so the API session sees
+# no traffic for 16-20 minutes at a stretch and idles out mid-run. The
+# heartbeat keeps it alive. It must be fail-soft: a missed ping can never be
+# allowed to break a download that is otherwise succeeding.
+
+import threading as _threading
+
+
+def _bare_session():
+    s = TechShareSession.__new__(TechShareSession)
+    s._session = requests.Session()
+    s._csrf_token = "TOKEN"
+    s._dpa_cache = "DPA"
+    return s
+
+
+def test_keepalive_pings_while_open_and_stops_after():
+    s = _bare_session()
+    pings = []
+    s._session_ping = lambda: (pings.append(1), True)[1]
+
+    with s.keepalive(interval_seconds=0.05):
+        time.sleep(0.28)
+        during = len(pings)
+    settled = len(pings)
+    time.sleep(0.2)
+
+    assert during >= 2, f"expected repeated pings during the transfer, got {during}"
+    assert len(pings) == settled, "heartbeat kept running after the transfer ended"
+
+
+def test_keepalive_survives_a_failing_ping():
+    """Fail-soft: a dead ping must not propagate into the download."""
+    s = _bare_session()
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        raise requests.ConnectionError("network blip")
+    s._session_ping = flaky
+
+    with s.keepalive(interval_seconds=0.05):
+        time.sleep(0.15)
+    # No exception escaped, and the transfer body ran to completion.
+    assert calls, "ping should have been attempted"
+
+
+def test_keepalive_does_not_mutate_cached_auth_state():
+    """The heartbeat runs concurrently with the stream — it must stay read-only.
+
+    Mutating _csrf_token from the heartbeat is exactly the class of bug that
+    made the 07-28 failure so hard to read.
+    """
+    s = _bare_session()
+    s._session_ping = lambda: True
+    with s.keepalive(interval_seconds=0.05):
+        time.sleep(0.12)
+    assert s._csrf_token == "TOKEN"
+    assert s._dpa_cache == "DPA"
+
+
+def test_keepalive_thread_is_daemon_and_exits():
+    s = _bare_session()
+    s._session_ping = lambda: True
+    before = _threading.active_count()
+    with s.keepalive(interval_seconds=0.05):
+        time.sleep(0.1)
+    time.sleep(0.2)
+    assert _threading.active_count() <= before, "keepalive thread leaked"
