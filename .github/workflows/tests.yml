@@ -1,0 +1,99 @@
+name: TechShare agent tests
+
+# 2026-07-31 — Codex Reliability Plan, Milestone 1 slice 1C.
+#
+# This repo had NO CI at all. It is embedded into the Mac app and shipped to
+# attorneys through Sparkle, so an untested change here reaches Matt's machine
+# via a Mac release without a single automated check having run.
+#
+# Pure-Python suite: no network, no keyring, no macOS-only APIs. Runs on the
+# free ubuntu tier in seconds — no macOS-minute cost.
+#
+# Python versions are NOT arbitrary. The agent runs on two different
+# interpreters in the real world:
+#   * 3.12 — what actually SHIPS. voxhora-mac/scripts/bundle_techshare_agent.sh
+#            pins python-build-standalone CPython 3.12.8 into the embedded kit,
+#            so this is the interpreter every attorney runs.
+#   * 3.9  — the floor in pyproject.toml (requires-python = ">=3.9") and what
+#            Patrick's own Mac checkout has been running.
+# Testing only one of them leaves the other unverified, so the matrix covers
+# both. 3.12 is the one that must never go red.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # a 3.9-only break must not hide a 3.12 result, or vice versa
+      matrix:
+        python-version: ["3.12", "3.9"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install ffmpeg
+        # NOT optional. tests/test_storage.py guards every media-conversion
+        # test with `if find_ffmpeg() is None: pytest.skip(...)` — eight tests
+        # covering discovery-video and unplayable-audio conversion. Without a
+        # discoverable ffmpeg they all SKIP, and the run still reports green
+        # while the conversion path this agent exists to perform went
+        # completely untested. The imageio-ffmpeg wheel below also carries a
+        # binary; installing the system one too means the media tests run even
+        # if that wheel's bundled binary is unusable on the runner.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -1
+
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-ci.txt
+          pip install -e . --no-deps   # package itself; deps already pinned above
+
+      - name: Assert ffmpeg is discoverable by the agent
+        # Turns a silent skip into a loud failure. If the agent's own
+        # find_ffmpeg() cannot locate a binary, the media tests below would
+        # quietly skip — this step fails the run instead so we never mistake
+        # "8 tests skipped" for "8 tests passed".
+        run: |
+          python -c "
+          from voxhora_techshare_agent.storage import find_ffmpeg
+          ff = find_ffmpeg()
+          assert ff, 'find_ffmpeg() returned None — media tests would silently skip'
+          print(f'find_ffmpeg() -> {ff}')
+          "
+
+      - name: Run pytest
+        # -rs prints a reason line for every skip, so expected platform skips
+        # are visible and separable from failures instead of vanishing into a
+        # bare pass count.
+        run: python -m pytest -q -rs
+
+      - name: Fail on unexpected skips
+        # The suite is expected to run with ZERO skips on this runner (58
+        # passed, 0 skipped, verified 2026-07-31). Any skip means a dependency
+        # went missing and coverage silently shrank. Report it as a failure
+        # rather than letting the green check overstate what was tested.
+        run: |
+          set -o pipefail
+          OUT=$(python -m pytest -q -rs 2>&1 | tail -20)
+          echo "$OUT"
+          case "$OUT" in
+            *skipped*)
+              echo "::error::Tests were SKIPPED on this runner — coverage is smaller than it looks."
+              exit 1
+              ;;
+          esac
+          echo "✓ No skipped tests — full suite actually executed."
