@@ -487,3 +487,63 @@ def test_fetch_items_success_emits_no_failure_line(tmp_path: Path, monkeypatch, 
 
     assert rc == 0
     assert _failed_items_json(capsys) is None
+
+
+# ------------------------------------------- durable run log (M5 prio 4)
+#
+# 2026-08-02 — the agent's output was piped to the Mac app and discarded;
+# there was no fetch log at all. config.log_dir() existed and nothing called
+# it. That absence is why Gomez had to be reconstructed from audit rows and
+# disk state instead of read out of a log.
+
+import logging as _logging
+
+from voxhora_techshare_agent import config as _config
+
+
+@pytest.fixture
+def _clean_root_handlers():
+    """Snapshot/restore root handlers so a test's FileHandler never leaks
+    into the real ~/Library/Logs or into another test."""
+    root = _logging.getLogger()
+    before = list(root.handlers)
+    yield
+    for h in list(root.handlers):
+        if h not in before:
+            h.close()
+            root.removeHandler(h)
+
+
+def test_run_log_is_written_and_carries_the_run_id(tmp_path: Path, monkeypatch, _clean_root_handlers):
+    monkeypatch.setattr(_config, "log_dir", lambda username=None: tmp_path)
+
+    run_id = cli._attach_run_log()
+    _logging.getLogger("voxhora_techshare_agent.cli").error("FAILED offense_report.pdf: prep 500")
+
+    logs = list(tmp_path.glob("agent-*.log"))
+    assert logs, "no run log file was created"
+    text = logs[0].read_text()
+    assert run_id in text, "run id missing — concurrent runs would be indistinguishable"
+    # The per-item detail is the whole point: this is what Gomez needed.
+    assert "offense_report.pdf" in text
+    assert "prep 500" in text
+
+
+def test_run_log_failure_never_breaks_the_run(tmp_path: Path, monkeypatch, capsys, _clean_root_handlers):
+    """Fail-soft: a read-only or missing log dir must NOT stop the agent from
+    fetching evidence. It degrades to the old stderr-only behavior."""
+    def _boom(username=None):
+        raise PermissionError("read-only volume")
+    monkeypatch.setattr(_config, "log_dir", _boom)
+
+    run_id = cli._attach_run_log()   # must not raise
+
+    assert run_id, "a run id is still required even when logging is unavailable"
+    assert "could not open run log" in capsys.readouterr().err
+
+
+def test_run_log_scrubs_anything_password_shaped():
+    """The log outlives the run, so don't trust argv to be secret-free."""
+    assert cli._scrub(["fetch", "C1CR26500006"]) == "fetch C1CR26500006"
+    assert cli._scrub(["login", "--password", "hunter2"]) == "login --password ***"
+    assert "hunter2" not in cli._scrub(["login", "-p", "hunter2"])

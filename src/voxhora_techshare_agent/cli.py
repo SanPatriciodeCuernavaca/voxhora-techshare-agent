@@ -21,6 +21,7 @@ import argparse
 import getpass
 import json
 import logging
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -34,6 +35,65 @@ from .proxy_client import TechShareClient
 from .session import TechShareAuthError, TechShareSession
 
 log = logging.getLogger(__name__)
+
+
+# ----- run log -----
+
+
+def _attach_run_log() -> str:
+    """Tee this run's log stream to a durable file and return the run id.
+
+    2026-08-02 (Milestone 5, priority 4). Until now the agent's output was
+    piped to the Mac app and then thrown away — there was NO fetch log at all.
+    That is why Gomez (C1CR26500006) could not be diagnosed from logs and had
+    to be reconstructed from audit rows and disk state: 44 of 58 items never
+    reached Dropbox and nothing anywhere recorded which ones or why.
+    `config.log_dir()` already existed for exactly this and was never wired to
+    anything.
+
+    One file per day, appended, with a header per run so concurrent or
+    successive runs stay separable. Attaches to the ROOT logger so the
+    per-item lines that matter — "skip (already-seen)", "streamed X -> Y",
+    "FAILED x: reason" — all land, not just this module's.
+
+    FAIL-SOFT BY DESIGN: a run must never fail to fetch evidence because it
+    could not open a log file. Any error here degrades to stderr-only logging,
+    which is exactly the old behavior.
+    """
+    run_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+    try:
+        path = config.log_dir() / f"agent-{datetime.now().strftime('%Y-%m-%d')}.log"
+        handler = logging.FileHandler(path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            f"%(asctime)s [{run_id}] %(name)s %(levelname)s: %(message)s"
+        ))
+        logging.getLogger().addHandler(handler)
+    except Exception as e:  # noqa: BLE001 — see FAIL-SOFT above
+        print(f"WARNING: could not open run log ({e}); continuing", file=sys.stderr)
+    return run_id
+
+
+def _scrub(argv: Sequence[str]) -> str:
+    """Render argv for the log without leaking a secret.
+
+    Credentials normally arrive via Keychain or an interactive getpass, never
+    on the command line — but this string goes to a file that outlives the
+    run, so anything that looks like a password is redacted rather than
+    trusted not to be there.
+    """
+    out: list[str] = []
+    redact_next = False
+    for a in argv:
+        if redact_next:
+            out.append("***")
+            redact_next = False
+            continue
+        if a in ("--password", "--pass", "-p", "--token"):
+            out.append(a)
+            redact_next = True
+            continue
+        out.append(a)
+    return " ".join(out)
 
 
 # ----- entrypoint -----
@@ -116,6 +176,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
+    # Wire the run log AFTER parsing, so --help and usage errors don't create
+    # a log entry, and BEFORE dispatch, so the whole command is captured.
+    run_id = _attach_run_log()
+    log.info("run %s start: %s", run_id, _scrub(sys.argv[1:] if argv is None else argv))
+
     dispatch = {
         "login": cmd_login,
         "status": cmd_status,
@@ -129,13 +194,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         "refresh": cmd_refresh,
         "backfill-all": cmd_backfill_all,
     }
+    # Every exit path records its code. A run that ends without a matching
+    # "run ... exit" line was killed, and that is itself the finding — the
+    # old behavior left no way to tell a killed run from a clean one.
     try:
-        return dispatch[args.command](args)
+        rc = dispatch[args.command](args)
+        log.info("run %s exit %s", run_id, rc)
+        return rc
     except TechShareAuthError as e:
+        log.error("run %s exit 2 (auth): %s", run_id, e)
         print(f"AUTH ERROR: {e}", file=sys.stderr)
         return 2
     except Exception as e:
         log.exception("unhandled error")
+        log.error("run %s exit 1: %s", run_id, e)
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
