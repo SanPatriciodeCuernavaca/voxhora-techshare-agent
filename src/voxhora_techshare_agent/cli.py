@@ -665,6 +665,21 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
     manifest_entries: dict[str, dict] = {}
     new_downloads = 0
     failures = len(missing)  # missing items count as failures
+    # 2026-08-02 (Milestone 5, priority 4) — every failure must carry its
+    # reason. cmd_fetch has done this since 2026-07-04; this path never did,
+    # so a failure here reached the lawyer as a bare count with no way to know
+    # WHICH evidence to go verify in TechShare. Same shape as cmd_fetch:
+    # [{"filename", "id", "reason"}].
+    failed_items: list[dict] = []
+    for fp in missing:
+        # A requested fingerprint that is no longer in the live DME list —
+        # usually a stale Portal manifest. Name it; "not in live list" is a
+        # real reason and the lawyer can act on it.
+        failed_items.append({
+            "filename": "(not in live DME list)",
+            "id": fp,
+            "reason": "requested fingerprint not present in TechShare's current DME list for this cause",
+        })
     for item in to_fetch:
         fp = storage.dme_fingerprint(item)
         if fp in seen:
@@ -742,9 +757,24 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
         except Exception as e:
             log.error("FAILED %s: %s", item.name, e)
             failures += 1
+            # 2026-08-02 (Milestone 5, priority 4) — record WHICH file failed
+            # and WHY, exactly as cmd_fetch does. Before this the reason lived
+            # only in stderr, which the Mac app discards.
+            failed_items.append({
+                "filename": item.name,
+                "id": fp,
+                "reason": str(e)[:300],
+            })
             storage.save_seen_dme_ids(seen)
 
     if manifest_path is not None:
+        # NOTE: failed_items is deliberately NOT passed here. _write_manifest
+        # treats a list as a REPLACEMENT for the cause's whole failure list,
+        # which is correct for `fetch` (it attempts every outstanding item) and
+        # WRONG for this path, which only attempts the subset the Portal asked
+        # for. Passing it would erase recorded failures for items this run
+        # never touched. None preserves them. The reasons still reach the Mac
+        # app via the FAILED-ITEMS-JSON line below.
         _write_manifest(manifest_path, cause_number, manifest_entries)
         log.info("wrote manifest: %s (%d entries)", manifest_path, len(manifest_entries))
 
@@ -752,6 +782,14 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
         f"OK — {cause_number}: {new_downloads} new files, {failures} failed, "
         f"{len(requested) - len(missing) - new_downloads} skipped-already-on-disk"
     )
+    # 2026-08-02 (Milestone 5, priority 4) — machine-readable per-file failure
+    # list, same contract as cmd_fetch: printed AFTER the "OK — " summary so
+    # older parsers that scan for that prefix are unaffected. DownloadJobsManager
+    # picks this up (it already parses the "FAILED-ITEMS-JSON: " prefix), so a
+    # fetch-items failure now reaches the lawyer with a reason attached instead
+    # of as a bare count.
+    if failed_items:
+        print("FAILED-ITEMS-JSON: " + json.dumps(failed_items, ensure_ascii=False))
     return 0 if failures == 0 else 2
 
 

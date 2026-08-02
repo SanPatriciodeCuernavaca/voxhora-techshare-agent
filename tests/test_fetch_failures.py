@@ -380,3 +380,110 @@ def test_keepalive_thread_is_daemon_and_exits():
         time.sleep(0.1)
     time.sleep(0.2)
     assert _threading.active_count() <= before, "keepalive thread leaked"
+
+
+# ------------------------------------ fetch-items failure reasons (M5 prio 4)
+#
+# 2026-08-02 — cmd_fetch has emitted FAILED-ITEMS-JSON since 2026-07-04;
+# cmd_fetch_items never did, so a Portal-driven fetch reported failures to the
+# lawyer as a bare count with no reason and no filename. These pin the fix.
+
+import argparse as _argparse
+
+from voxhora_techshare_agent import storage as _storage
+
+
+class _FakeSessionOK:
+    def ensure_authenticated(self):
+        return None
+
+
+class _FakeItemsClient:
+    """Serves a fixed DME list; raises for any name in `fail_on`."""
+
+    def __init__(self, items, fail_on=None):
+        self._items = items
+        self._fail_on = set(fail_on or ())
+
+    def get_case_detail(self, service_id, case_uuid):
+        return {"uuid": case_uuid}
+
+    def get_dme_list(self, service_id, case):
+        return self._items
+
+    def download_dme_file_to_path(self, service_id, item, path):
+        if item.name in self._fail_on:
+            raise RuntimeError("prep 500 from TechShare")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+        return 1
+
+
+def _wire_fetch_items(monkeypatch, tmp_path, items, fail_on=None):
+    monkeypatch.setattr(cli, "_resolve_case", lambda c: {"service_id": "svc", "case_uuid": "uuid"})
+    monkeypatch.setattr(cli, "TechShareSession", lambda: _FakeSessionOK())
+    monkeypatch.setattr(cli, "TechShareClient", lambda s: _FakeItemsClient(items, fail_on))
+    monkeypatch.setattr(_storage, "load_seen_dme_ids", lambda *a, **k: set())
+    monkeypatch.setattr(_storage, "save_seen_dme_ids", lambda *a, **k: None)
+    monkeypatch.setattr(
+        _storage, "case_discovery_target_path",
+        lambda item, cause, target_dir=None: tmp_path / item.name,
+    )
+
+
+def _args(cause, item_ids, tmp_path):
+    return _argparse.Namespace(
+        cause_number=cause, service_id="svc", case_uuid="uuid",
+        item_ids=item_ids, target_dir=str(tmp_path), manifest=None,
+    )
+
+
+def _failed_items_json(capsys):
+    """Parse the FAILED-ITEMS-JSON line out of stdout, or None if absent."""
+    for line in capsys.readouterr().out.splitlines():
+        if line.startswith("FAILED-ITEMS-JSON: "):
+            return json.loads(line[len("FAILED-ITEMS-JSON: "):])
+    return None
+
+
+def test_fetch_items_reports_reason_for_download_failure(tmp_path: Path, monkeypatch, capsys):
+    """A file that fails to download must reach the lawyer WITH its reason —
+    not as a bare 'N failed' count."""
+    item = _item("offense_report.pdf", "12 KB")
+    _wire_fetch_items(monkeypatch, tmp_path, [item], fail_on={"offense_report.pdf"})
+
+    rc = cli.cmd_fetch_items(_args("C1CR26500006", ["dmeId:abc"], tmp_path))
+
+    assert rc == 2
+    failed = _failed_items_json(capsys)
+    assert failed is not None, "fetch-items emitted no FAILED-ITEMS-JSON line"
+    assert len(failed) == 1
+    assert failed[0]["filename"] == "offense_report.pdf"
+    assert failed[0]["id"] == "dmeId:abc"
+    assert "prep 500" in failed[0]["reason"]
+
+
+def test_fetch_items_reports_reason_for_missing_fingerprint(tmp_path: Path, monkeypatch, capsys):
+    """A requested item no longer in TechShare's live list already counted as
+    a failure — it must now say WHY, and name which fingerprint."""
+    _wire_fetch_items(monkeypatch, tmp_path, [])
+
+    rc = cli.cmd_fetch_items(_args("C1CR26500006", ["dmeId:deadbeef"], tmp_path))
+
+    assert rc == 2
+    failed = _failed_items_json(capsys)
+    assert failed is not None, "fetch-items emitted no FAILED-ITEMS-JSON line"
+    assert failed[0]["id"] == "dmeId:deadbeef"
+    assert failed[0]["reason"].strip() != ""
+
+
+def test_fetch_items_success_emits_no_failure_line(tmp_path: Path, monkeypatch, capsys):
+    """No failures ⇒ no FAILED-ITEMS-JSON line at all, so the Mac app's
+    parser never sees an empty array it has to special-case."""
+    item = _item("dashcam.pdf", "9 KB")
+    _wire_fetch_items(monkeypatch, tmp_path, [item])
+
+    rc = cli.cmd_fetch_items(_args("C1CR26500006", ["dmeId:abc"], tmp_path))
+
+    assert rc == 0
+    assert _failed_items_json(capsys) is None
