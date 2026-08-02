@@ -89,6 +89,28 @@ def dropbox_case_discovery_dir(cause_number: str) -> Path:
     return base / cause_number
 
 
+def portal_case_dirs(cause_number: str) -> list[Path]:
+    """Every Discovery Portal folder that could hold this cause's evidence.
+
+    2026-08-02 (Milestone 5, priority 3). The Portal reads
+    ~/Dropbox/Voxhora/Discovery/<client>/<cause>/ — note this is NOT
+    dropbox_case_discovery_dir() above, which points at Case_Discovery/ and is
+    the agent's default hand-run path, not where the Portal looks. Conflating
+    the two is what made 28 re-fetched Gomez documents land somewhere the
+    Portal could not see them.
+
+    Globs by cause because the agent does not know the client folder name --
+    the Mac app composes that. Cause numbers are unique, so this normally
+    yields exactly one directory; a list is returned so a client rename that
+    left two folders behind cannot silently hide evidence.
+    """
+    override = os.environ.get("VOXHORA_DROPBOX_DISCOVERY")
+    base = Path(override).expanduser() if override else Path.home() / "Dropbox" / "Voxhora" / "Discovery"
+    if not base.is_dir():
+        return []
+    return [d for d in base.glob(f"*/{cause_number}") if d.is_dir()]
+
+
 def service_backend_for_scope(service_id: str) -> str:
     """Map a service UUID to its backend base URL."""
     if service_id == SERVICE_TRAVIS_COUNTY_ATTORNEY:

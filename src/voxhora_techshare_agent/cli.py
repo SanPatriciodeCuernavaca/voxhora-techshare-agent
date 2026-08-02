@@ -590,8 +590,20 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     for item in dme_items:
         fp = storage.dme_fingerprint(item)
         if fp in seen:
-            log.info("skip (already-seen): %s", item.name)
-            continue
+            # 2026-08-02 (Milestone 5, priority 3) — "seen" alone is not
+            # enough. It was written at local-write time, before anything
+            # reached Dropbox, so on Gomez 44 of 58 items were marked
+            # satisfied forever while the upload had failed and staging was
+            # cleared. Trust the skip ONLY if the evidence is actually where
+            # the Portal reads.
+            if storage.is_present_in_portal(item, cause_number):
+                log.info("skip (already-seen): %s", item.name)
+                continue
+            log.warning(
+                "re-fetching %s — marked seen but NOT present in the Portal "
+                "(this is the Gomez case: downloaded once, never landed)",
+                item.name,
+            )
         # Patrick 2026-05-27 LOCK — DO NOT skip on `is_archived`.
         # TechShare flips that flag when the attorney has viewed an
         # item on the web UI; it does NOT mean "should not download."
@@ -754,7 +766,11 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
         })
     for item in to_fetch:
         fp = storage.dme_fingerprint(item)
-        if fp in seen:
+        if fp in seen and not storage.is_present_in_portal(item, cause_number):
+            log.warning(
+                "re-fetching %s — marked seen but NOT present in the Portal", item.name
+            )
+        elif fp in seen:
             log.info("skip (already-seen): %s", item.name)
             # Still surface in manifest so the Portal sees the existing on-disk
             # state. A prior run may have converted + hidden the original —

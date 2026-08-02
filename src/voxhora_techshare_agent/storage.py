@@ -222,6 +222,66 @@ def convert_msg_to_text(msg_path: Path) -> Path | None:
         return None
 
 
+def is_present_in_portal(item: DMEItem, cause_number: str) -> bool:
+    """Is this item's evidence actually sitting where the Discovery Portal reads?
+
+    2026-08-02 (Milestone 5, priority 3). The seen-set records "I downloaded
+    these bytes once", written at LOCAL-write time before anything reached
+    Dropbox. On Gomez (C1CR26500006) that meant 44 of 58 items -- including the
+    offense report and the EPO -- were marked satisfied forever while the
+    upload had failed and staging was cleared. This is the check that makes
+    "seen" mean "present", so a run that never landed gets retried instead of
+    skipped permanently.
+
+    Naming is the whole difficulty here; a plain name check is wrong in BOTH
+    directions and every case below is a real one that has already bitten:
+      * video/audio the Portal cannot play are CONVERTED on landing --
+        <name>.wmv -> .mp4, .wma -> .m4a (Gomez's three police interviews).
+        Checking the original name reports them missing and would re-download
+        gigabytes on every single run.
+      * ZIPs land as an EXTRACTED FOLDER plus a dot-hidden original
+        (".Foo.zip"), never as "Foo.zip".
+    """
+    # PC affidavits are DELIBERATELY not in the Portal. Automatic intake puts
+    # them in Bulk_Inbox -> client documents -> synopsis, and Patrick's rule is
+    # that they must NEVER create a Discovery Portal entry (2026-08-02: he
+    # reversed the earlier "fetch it into the Portal too" idea in favour of
+    # reliability). Requiring Portal presence would re-download every PC on
+    # every run AND start creating the Portal entries the rule forbids.
+    if item.is_pc_affidavit:
+        return True
+
+    # Items the Portal can never use (encrypted in-car video + its Windows
+    # player) are intentionally never uploaded, so absence proves nothing.
+    if not _is_portal_usable_name(item.name):
+        return True
+
+    dirs = config.portal_case_dirs(cause_number)
+    if not dirs:
+        return False        # no Portal folder at all => nothing landed
+
+    name = item.name
+    stem = Path(name).stem
+    if name.lower().endswith(".zip"):
+        candidates = [name, f".{name}", stem]      # original, dot-hidden, extracted folder
+    else:
+        candidates = [name, f"{stem}.mp4", f"{stem}.m4a"]   # original or converted sibling
+
+    for d in dirs:
+        for cand in candidates:
+            if (d / cand).exists():
+                return True
+    return False
+
+
+def _is_portal_usable_name(name: str) -> bool:
+    """Mirror of the Mac uploader's isNotPortalUsable. Kept in sync by
+    tests/test_storage.py -- if these two drift, items the uploader silently
+    drops would be re-downloaded on every run."""
+    ext = Path(name).suffix.lower().lstrip(".")
+    return ext not in {"av3", "av", "dll", "exe", "ax", "ocx", "manifest"}
+
+
 def hide_zip_after_extract(zip_path: Path) -> Path | None:
     """Rename `Photos.zip` → `.Photos.zip` so DiscoveryFolderScanner's
     `.skipsHiddenFiles` enumerator skips it from the Portal grid while

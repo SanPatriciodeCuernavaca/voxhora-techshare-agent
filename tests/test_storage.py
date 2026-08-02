@@ -406,3 +406,92 @@ def test_lookup_case_accepts_the_dashed_county_form(monkeypatch, tmp_path):
     assert storage.lookup_case("C1CR25208407") is not None
     assert storage.lookup_case("c-1-cr-25-208407") is not None
     assert storage.lookup_case("D1DC99999999") is None
+
+
+# ------------------- Portal presence check (M5 priority 3, 2026-08-02) -------
+#
+# "seen" was written at LOCAL-write time, before anything reached Dropbox. On
+# Gomez that left 44 of 58 items marked satisfied forever while the upload had
+# failed and staging was cleared. These pin the rule that makes a skip mean
+# "it's actually there".
+
+def _dme(name: str, pc: bool = False):
+    from voxhora_techshare_agent.models import DMEItem
+    it = DMEItem(
+        name=name, type="Video - BodyCam", source="Government", size="1 KB",
+        available_date="6/16/2026", last_accessed_date=None, is_archived=False,
+        enclosure_href="https://x/dmefile?dmeId=abc", api_href=None,
+    )
+    object.__setattr__(it, "_force_pc", pc) if False else None
+    return it
+
+
+def _portal(monkeypatch, tmp_path, cause="C1CR26203183"):
+    d = tmp_path / "Discovery" / "Resendiz Figueroa, Bryan" / cause
+    d.mkdir(parents=True)
+    monkeypatch.setattr(config, "portal_case_dirs", lambda c: [d] if c == cause else [])
+    return d
+
+
+def test_present_when_the_file_is_in_the_portal(monkeypatch, tmp_path):
+    d = _portal(monkeypatch, tmp_path)
+    (d / "offense_report.pdf").write_bytes(b"x")
+    assert storage.is_present_in_portal(_dme("offense_report.pdf"), "C1CR26203183")
+
+
+def test_absent_is_the_gomez_case_and_must_re_fetch(monkeypatch, tmp_path):
+    _portal(monkeypatch, tmp_path)
+    assert not storage.is_present_in_portal(_dme("offense_report.pdf"), "C1CR26203183"), \
+        "an item marked seen but missing from the Portal is exactly Gomez — it must re-fetch"
+
+
+def test_no_portal_folder_at_all_is_not_durable(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "portal_case_dirs", lambda c: [])
+    assert not storage.is_present_in_portal(_dme("anything.pdf"), "C1CR99999999")
+
+
+def test_converted_audio_sibling_counts_as_present(monkeypatch, tmp_path):
+    """Gomez's police interviews were .wma converted to .m4a on landing.
+    Checking the original name would re-download them every single run."""
+    d = _portal(monkeypatch, tmp_path)
+    (d / "interview.m4a").write_bytes(b"x")
+    assert storage.is_present_in_portal(_dme("interview.wma"), "C1CR26203183")
+
+
+def test_converted_video_sibling_counts_as_present(monkeypatch, tmp_path):
+    d = _portal(monkeypatch, tmp_path)
+    (d / "incar.mp4").write_bytes(b"x")
+    assert storage.is_present_in_portal(_dme("incar.wmv"), "C1CR26203183")
+
+
+def test_zip_counts_via_extracted_folder(monkeypatch, tmp_path):
+    """ZIPs land as an extracted FOLDER, never as the .zip itself."""
+    d = _portal(monkeypatch, tmp_path)
+    (d / "IN CAR VIDEO SMITH").mkdir()
+    assert storage.is_present_in_portal(_dme("IN CAR VIDEO SMITH.zip"), "C1CR26203183")
+
+
+def test_zip_counts_via_dot_hidden_original(monkeypatch, tmp_path):
+    d = _portal(monkeypatch, tmp_path)
+    (d / ".Unknown_TCSO.zip").write_bytes(b"x")
+    assert storage.is_present_in_portal(_dme("Unknown_TCSO.zip"), "C1CR26203183")
+
+
+def test_unplayable_items_are_never_re_fetched(monkeypatch, tmp_path):
+    """Encrypted in-car video is deliberately never uploaded, so its absence
+    from the Portal proves nothing and must not trigger a re-download."""
+    _portal(monkeypatch, tmp_path)
+    assert storage.is_present_in_portal(_dme("clip.av3"), "C1CR26203183")
+    assert storage.is_present_in_portal(_dme("SafeServ.exe"), "C1CR26203183")
+
+
+def test_pc_affidavit_is_never_expected_in_the_portal(monkeypatch, tmp_path):
+    """THE INTAKE GUARDRAIL. PCs go to Bulk_Inbox -> client documents ->
+    synopsis and must NEVER create a Discovery Portal entry. If this check
+    demanded Portal presence, every PC would re-download on every run AND
+    start creating the entries Patrick's rule forbids."""
+    _portal(monkeypatch, tmp_path)   # empty Portal folder
+    pc = _dme("C1CR26203183.pdf")
+    monkeypatch.setattr(type(pc), "is_pc_affidavit", property(lambda self: True))
+    assert storage.is_present_in_portal(pc, "C1CR26203183"), \
+        "a PC must never be treated as missing-from-Portal"
