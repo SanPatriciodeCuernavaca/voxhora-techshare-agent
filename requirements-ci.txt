@@ -1,0 +1,26 @@
+# Pinned CI dependencies — voxhora-techshare-agent
+#
+# 2026-07-31 — Codex Reliability Plan, Milestone 1 slice 1C.
+#
+# pyproject.toml declares FLOATING lower bounds (">=") so that Patrick's Mac
+# and the embedded kit can pick up fixes. That is right for shipping and wrong
+# for a test gate: a floating resolve means a CI run that passes today can fail
+# tomorrow for reasons that have nothing to do with a code change, and a green
+# check would no longer mean "this commit is good."
+#
+# These are the exact versions the suite is known green against (58 passed,
+# 0 failures, verified 2026-07-31). CI installs THESE so a red run always
+# means the commit changed something.
+#
+# When bumping: change a pin, watch CI, and keep pyproject.toml's floors as
+# the shipping contract. This file is a test-determinism device, NOT the
+# dependency policy for the embedded agent kit.
+
+extract-msg==0.55.0
+requests==2.32.5
+keyring==25.7.0
+imageio-ffmpeg==0.6.0
+
+# dev extras
+pytest==8.4.2
+pytest-mock==3.15.1
