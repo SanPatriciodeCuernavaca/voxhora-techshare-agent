@@ -131,3 +131,72 @@ def test_kib_multiplier_would_break_it(tmp_path: Path):
     p = _write(tmp_path / item.name, 5_009_920_915)
     assert storage.staged_copy_is_complete(item, p) is True
     assert 5_009_920 * 1024 != 5_009_920_915        # the mistake this pins
+
+
+# ----- end to end: cmd_fetch must not call the network at all -----
+
+class _RefuseToDownload:
+    """Serves a DME list; any download attempt fails the test outright.
+
+    The predicate tests above prove the DECISION. This proves the WIRING —
+    that cmd_fetch actually consults it before reaching for the network.
+    """
+
+    def __init__(self, items):
+        self._items = items
+        self.attempts: list[str] = []
+
+    def get_case_detail(self, service_id, case_uuid):
+        return {"uuid": case_uuid}
+
+    def get_dme_list(self, service_id, case):
+        return self._items
+
+    def download_dme_file_to_path(self, service_id, item, path):
+        self.attempts.append(item.name)
+        raise AssertionError(
+            f"re-downloaded {item.name!r} — the complete staged copy should have been used"
+        )
+
+
+class _SessionOK:
+    def ensure_authenticated(self):
+        pass
+
+
+def test_cmd_fetch_skips_the_network_when_the_bytes_are_already_staged(tmp_path, monkeypatch):
+    """The Rai scenario end to end: complete in staging, absent from Dropbox.
+
+    Without the fix cmd_fetch re-pulls the whole file from TechShare — 5.01 GB
+    and 29 minutes on Rai C1CR25207191. Here the fake client raises if it is
+    ever asked to download, so a regression fails loudly instead of quietly
+    costing the county another copy.
+    """
+    import argparse as _argparse
+    from voxhora_techshare_agent import cli
+    from voxhora_techshare_agent import storage as _storage
+
+    item = _item("Axon_Fleet_3_Front.mp4", "1,421,728 KB")
+    _write(tmp_path / item.name, 1_421_728_115)      # the real Cannon landing
+    client = _RefuseToDownload([item])
+
+    monkeypatch.setattr(cli, "_resolve_case", lambda c: {"service_id": "svc", "case_uuid": "uuid"})
+    monkeypatch.setattr(cli, "TechShareSession", lambda: _SessionOK())
+    monkeypatch.setattr(cli, "TechShareClient", lambda s: client)
+    monkeypatch.setattr(_storage, "load_seen_dme_ids", lambda *a, **k: set())
+    monkeypatch.setattr(_storage, "save_seen_dme_ids", lambda *a, **k: None)
+    monkeypatch.setattr(
+        _storage, "case_discovery_target_path",
+        lambda item, cause, target_dir=None: tmp_path / item.name,
+    )
+    # Not in Dropbox yet — exactly why priority 3 would order a re-fetch.
+    monkeypatch.setattr(_storage, "is_present_in_portal", lambda item, cause: False)
+
+    rc = cli.cmd_fetch(_argparse.Namespace(
+        cause_number="C1CR25207191", service_id="svc", case_uuid="uuid",
+        item_ids=None, target_dir=str(tmp_path), manifest=None,
+    ))
+
+    assert client.attempts == [], "cmd_fetch must not touch the network for staged bytes"
+    assert rc == 0
+    assert (tmp_path / item.name).stat().st_size == 1_421_728_115, "staged bytes untouched"

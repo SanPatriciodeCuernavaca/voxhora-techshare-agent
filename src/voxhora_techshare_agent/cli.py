@@ -604,6 +604,30 @@ def cmd_fetch(args: argparse.Namespace) -> int:
                 "(this is the Gomez case: downloaded once, never landed)",
                 item.name,
             )
+        # 2026-08-03 (Milestone 5) — never pay for bytes already on disk.
+        # The Portal check above looks in DROPBOX, so a file that downloaded
+        # fine but has not been uploaded yet reads as absent: that is how a
+        # 5.01 GB Axon video came down from TechShare a second time on Rai
+        # C1CR25207191 (29 minutes, needless county load).
+        # staged_copy_is_complete is conservative — byte-exact at the final
+        # name only, and never anything still owed ZIP extraction or media
+        # conversion — so an interrupted, truncated or unconverted file
+        # re-downloads exactly as before. Skipping does NOT mark the item
+        # seen; "seen" still means verified in Dropbox (priority 3), and the
+        # upload leg is what settles that.
+        staged_path = storage.case_discovery_target_path(
+            item, cause_number, target_dir=target_dir
+        )
+        if storage.staged_copy_is_complete(item, staged_path):
+            log.info(
+                "skip download (complete copy already staged, awaiting upload): %s",
+                item.name,
+            )
+            manifest_entries[fp] = _manifest_entry(
+                item, staged_path, staged_path.stat().st_size
+            )
+            continue
+
         # Patrick 2026-05-27 LOCK — DO NOT skip on `is_archived`.
         # TechShare flips that flag when the attorney has viewed an
         # item on the web UI; it does NOT mean "should not download."
