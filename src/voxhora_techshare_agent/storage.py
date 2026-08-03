@@ -271,6 +271,68 @@ def is_present_in_portal(item: DMEItem, cause_number: str) -> bool:
         for cand in candidates:
             if (d / cand).exists():
                 return True
+    return _same_size_twin_present(item, dirs)
+
+
+# Below this, a byte-size match is not evidence of anything: small PDFs
+# collide readily. Above it, two DIFFERENT police videos matching to the byte
+# is implausible. Measured 2026-08-03 across Patrick's whole Portal: 323 files
+# >= 50 MB held only 299 distinct sizes, and every one of the 19 collisions was
+# a recording stored under two names (one descriptive, one short) -- e.g.
+# " Deputyy Garcia, Abel (Badge ID S5753) - DWILocal Timezone..." beside
+# "DWI(1).mp4". Not one looked like two different videos.
+_SIZE_TWIN_FLOOR_BYTES = 50 * 1024 * 1024
+
+
+def _same_size_twin_present(item: DMEItem, dirs: list[Path]) -> bool:
+    """Is this item's evidence already here under one of TechShare's OTHER
+    names for it?
+
+    2026-08-03. TechShare's DME list catalogues the same recording more than
+    once, with different names -- 16 of 33 items on C1CR26206330 carry a "(N)"
+    suffix, and one pair differs only by TechShare's own typo ("Deputy" vs
+    "Deputyy"). A name-only presence check cannot see that two names point at
+    one video, so every such twin is downloaded again: 27.39 GB of duplicated
+    video across 24 redundant copies already sits in the Portal, and a live
+    fetch was watched re-pulling a 3.48 GB video whose twin was right there.
+
+    That cost lands on every attorney, not just an existing library -- a new
+    lawyer pays for the same duplicate bandwidth AND double Dropbox storage
+    from his first case.
+
+    Deliberately narrow, because a false "present" here would hide genuinely
+    missing evidence, which is far worse than a wasted download:
+      * only at or above _SIZE_TWIN_FLOOR_BYTES, where a coincidental match is
+        implausible; small files keep the strict name-only rule and cost
+        seconds to re-fetch anyway.
+      * the match is the same exact byte window used everywhere else
+        (floor(bytes/1000) == the KB TechShare reports), not a tolerance.
+      * sizes only. Portal files are Dropbox online-only placeholders -- stat()
+        reads the size without materialising anything, while hashing contents
+        would force a multi-GB download and defeat the point.
+    """
+    window = expected_size_range(item)
+    if window is None:
+        return False
+    low, high = window
+    if low < _SIZE_TWIN_FLOOR_BYTES:
+        return False
+    for d in dirs:
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue
+        for p in entries:
+            try:
+                if p.is_file() and low <= p.stat().st_size <= high:
+                    log.info(
+                        "already present under another TechShare name: %s "
+                        "matches %s byte-for-byte (%d) — not re-downloading",
+                        item.name, p.name, p.stat().st_size,
+                    )
+                    return True
+            except OSError:
+                continue
     return False
 
 
