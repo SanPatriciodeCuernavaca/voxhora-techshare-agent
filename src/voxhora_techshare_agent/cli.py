@@ -22,6 +22,7 @@ import getpass
 import json
 import logging
 import os
+import platform
 import re
 import sys
 from datetime import datetime, timezone
@@ -180,6 +181,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     # a log entry, and BEFORE dispatch, so the whole command is captured.
     run_id = _attach_run_log()
     log.info("run %s start: %s", run_id, _scrub(sys.argv[1:] if argv is None else argv))
+    # 2026-08-03 — say WHICH agent produced this run. The Mac app can launch
+    # either the managed kit shipped inside Voxhora-Mac.app (what attorneys
+    # get, Python 3.12) or Patrick's dev checkout (Python 3.9), and until now
+    # nothing recorded the choice. Three separate failures today were invisible
+    # for exactly that reason: a week-stale kit, a launch install that never
+    # fired, and a kit venv that could not execute — each time the app quietly
+    # ran one agent while we reasoned about the other. One line settles it
+    # forever, and it is the first thing to read when a run behaves unexpectedly.
+    log.info("run %s interpreter: %s (python %s)",
+             run_id, sys.executable, platform.python_version())
 
     dispatch = {
         "login": cmd_login,
