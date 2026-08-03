@@ -791,6 +791,31 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
             if existing_path.exists():
                 manifest_entries[fp] = _manifest_entry(item, existing_path, existing_path.stat().st_size)
             continue
+        # 2026-08-03 (Milestone 5) — never pay for bytes already on disk.
+        # The Portal presence check above looks in DROPBOX; a file that
+        # downloaded fine but has not been uploaded yet still reads as
+        # absent, so yesterday a 5.01 GB Axon video came down from
+        # TechShare a second time (29 minutes, needless county load).
+        # storage.staged_copy_is_complete is conservative: it matches only
+        # a byte-exact copy at the final name, and refuses anything still
+        # owed ZIP extraction or media conversion, so an interrupted,
+        # truncated, or unconverted file re-downloads exactly as before.
+        # Skipping does NOT mark the item seen — "seen" still means
+        # verified in Dropbox (priority 3), and the upload leg is what
+        # settles that.
+        staged_path = storage.case_discovery_target_path(
+            item, cause_number, target_dir=target_dir
+        )
+        if storage.staged_copy_is_complete(item, staged_path):
+            log.info(
+                "skip download (complete copy already staged, awaiting upload): %s",
+                item.name,
+            )
+            manifest_entries[fp] = _manifest_entry(
+                item, staged_path, staged_path.stat().st_size
+            )
+            continue
+
         # Patrick 2026-05-27 LOCK — `is_archived` is TechShare's
         # "attorney viewed it on the web" flag, NOT a "should skip
         # download" signal. Removed: bulk fetch downloads EVERYTHING

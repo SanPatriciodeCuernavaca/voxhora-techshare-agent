@@ -282,6 +282,71 @@ def _is_portal_usable_name(name: str) -> bool:
     return ext not in {"av3", "av", "dll", "exe", "ax", "ocx", "manifest"}
 
 
+def expected_size_range(item: DMEItem) -> tuple[int, int] | None:
+    """TechShare's reported size as an exact byte range, or None if unusable.
+
+    TechShare reports `size` as a human string in DECIMAL kB truncated to
+    whole units -- "17,026 KB" means floor(bytes / 1000) == 17026, so the
+    real file is in [17026*1000, 17026*1000 + 999].
+
+    Measured 2026-08-03 against every landed Portal file that had a cached
+    list entry: 877/877 fell inside that range (min delta 0 B, max 999 B)
+    across 84 causes and 10 file types. The "KB" label is DECIMAL, not KiB
+    -- multiplying by 1024 matches only 135/877 and understates every
+    multi-GB video by ~2.3%.
+    """
+    raw = (item.size or "").strip().upper().replace(",", "").replace("KB", "").strip()
+    try:
+        kilobytes = int(raw)
+    except ValueError:
+        return None                 # 3 of 2,351 cached items carry an empty size
+    if kilobytes <= 0:
+        return None
+    low = kilobytes * 1000
+    return (low, low + 999)
+
+
+def staged_copy_is_complete(item: DMEItem, path: Path) -> bool:
+    """True when `path` already holds a byte-complete copy of `item`.
+
+    2026-08-03 (Milestone 5) -- lets `fetch` skip re-downloading evidence
+    already on disk awaiting its Dropbox upload. Yesterday a 5.01 GB Axon
+    video was pulled from TechShare a SECOND time (29 minutes, needless
+    county load) purely because the Portal presence check looks in Dropbox
+    while the bytes were still sitting in staging.
+
+    Deliberately CONSERVATIVE -- every uncertain case returns False and
+    re-downloads, which is exactly today's behaviour:
+
+    * an interrupted download lives at `<name>.partial`, never `<name>`, so
+      it cannot match here. A TRUNCATED file that got renamed anyway misses
+      the size window by megabytes and is re-fetched.
+    * items still needing post-download work (ZIP extraction, video/audio
+      conversion) are never skipped -- the download block owns that work,
+      and a file sitting at its plain original name proves it has not run.
+    * no usable size from TechShare => False.
+
+    This does NOT mark the item seen or present. "Seen" still means verified
+    in Dropbox (Milestone 5 priority 3); this only avoids paying twice for
+    bytes we already have.
+    """
+    window = expected_size_range(item)
+    if window is None:
+        return False
+    if path.suffix.lower() == ".zip":
+        return False
+    if is_portal_unplayable_video(path) or is_portal_audio_candidate(path):
+        return False
+    if not path.is_file():
+        return False
+    try:
+        actual = path.stat().st_size
+    except OSError:
+        return False
+    low, high = window
+    return low <= actual <= high
+
+
 def hide_zip_after_extract(zip_path: Path) -> Path | None:
     """Rename `Photos.zip` → `.Photos.zip` so DiscoveryFolderScanner's
     `.skipsHiddenFiles` enumerator skips it from the Portal grid while
