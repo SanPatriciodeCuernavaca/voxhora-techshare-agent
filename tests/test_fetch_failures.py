@@ -415,8 +415,15 @@ class _FakeItemsClient:
         if item.name in self._fail_on:
             raise RuntimeError("prep 500 from TechShare")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"x")
-        return 1
+        # 2026-08-03 — write a size consistent with the item's own DME-list
+        # entry. cmd_fetch/cmd_fetch_items now reject a landing that
+        # disagrees with TechShare's inventory (the short-download guard),
+        # and a 1-byte stand-in for a "9 KB" item is not a faithful fake:
+        # it made this fixture exercise the truncation path by accident.
+        window = _storage.expected_size_range(item)
+        written = window[0] if window else 1
+        path.write_bytes(b"x" * written)
+        return written
 
 
 def _wire_fetch_items(monkeypatch, tmp_path, items, fail_on=None):

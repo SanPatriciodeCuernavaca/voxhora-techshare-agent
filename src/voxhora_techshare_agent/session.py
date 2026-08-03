@@ -58,6 +58,55 @@ class TechShareAuthError(RuntimeError):
     """Login or session-revalidation failed."""
 
 
+class TruncatedDownloadError(RuntimeError):
+    """The transfer ended early — fewer bytes arrived than the host promised.
+
+    2026-08-03. Both streaming paths used to `os.replace` the .partial onto
+    the final name whatever arrived: `iter_content` simply stops when a
+    connection closes, and a close that raises nothing is indistinguishable
+    from a completed body. A short file then looked complete forever — it
+    uploaded, content-hash-verified as a faithful TRANSFER of the truncated
+    bytes, and was marked seen. That is silent evidence loss, and it is the
+    one failure mode a lawyer cannot detect by looking.
+
+    Raised BEFORE the rename, so the incomplete bytes stay in .partial where
+    a retry can resume them and where nothing mistakes them for evidence.
+    proxy_client.download_dme_file_to_path already retries 3x with a fresh
+    prep, so a genuine blip self-heals; a persistent mismatch surfaces as a
+    named failure with a reason attached (Milestone 5 priority 4).
+    """
+
+
+def _promised_body_bytes(response, resume_from: int = 0) -> int | None:
+    """How many bytes the host says the finished file holds, or None.
+
+    Returns None whenever the answer would be untrustworthy, because a
+    false mismatch here would re-download healthy multi-GB evidence
+    forever:
+
+    * Content-Encoding set — requests transparently decodes the body, so
+      the length header describes the COMPRESSED size, not what we write.
+    * no Content-Length at all — a chunked response never carries one.
+
+    Content-Range's total ("bytes 500-999/1000") is authoritative when
+    present. Plain Content-Length describes only THIS response body, so on
+    a resumed 206 it covers just the tail and the offset already on disk
+    has to be added back.
+    """
+    if response.headers.get("Content-Encoding"):
+        return None
+    content_range = response.headers.get("Content-Range", "")
+    if "/" in content_range:
+        total = content_range.rsplit("/", 1)[1].strip()
+        if total.isdigit():
+            return int(total)
+    raw = response.headers.get("Content-Length")
+    try:
+        return int(raw) + resume_from
+    except (TypeError, ValueError):
+        return None
+
+
 class TechShareSession:
     """Authenticated HTTP session against attorney.techsharetx.gov.
 
@@ -378,6 +427,7 @@ class TechShareSession:
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
         partial = target_path.with_suffix(target_path.suffix + ".partial")
+        promised = _promised_body_bytes(r)
         bytes_written = 0
         try:
             with open(partial, "wb") as f:
@@ -385,6 +435,11 @@ class TechShareSession:
                     if chunk:
                         f.write(chunk)
                         bytes_written += len(chunk)
+            if promised is not None and bytes_written != promised:
+                raise TruncatedDownloadError(
+                    f"{target_path.name}: got {bytes_written} bytes, host promised "
+                    f"{promised} — refusing to store a short file as complete"
+                )
             os.replace(partial, target_path)
             return bytes_written
         except BaseException:
@@ -593,6 +648,7 @@ class TechShareSession:
                 )
                 resume_from = 0
 
+        promised = _promised_body_bytes(r, resume_from=resume_from)
         bytes_written = resume_from
         try:
             # Hold the API session open for the whole transfer. Without this
@@ -603,6 +659,16 @@ class TechShareSession:
                     if chunk:
                         f.write(chunk)
                         bytes_written += len(chunk)
+            # 2026-08-03 — the DME host drops long streams (the very reason
+            # the resume above exists), and a drop that closes cleanly raises
+            # nothing. Without this the short file was renamed as complete.
+            # Raising KEEPS the .partial, so the caller's retry resumes from
+            # here instead of paying for the gigabytes again.
+            if promised is not None and bytes_written != promised:
+                raise TruncatedDownloadError(
+                    f"{target_path.name}: got {bytes_written} bytes, host promised "
+                    f"{promised} — refusing to store a short file as complete"
+                )
             os.replace(partial, target_path)
             return bytes_written
         except BaseException:

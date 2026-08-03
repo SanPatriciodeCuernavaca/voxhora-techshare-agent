@@ -306,6 +306,49 @@ def expected_size_range(item: DMEItem) -> tuple[int, int] | None:
     return (low, low + 999)
 
 
+class ShortDownloadError(RuntimeError):
+    """A landed file is smaller than TechShare's own DME list says it is."""
+
+
+def verify_downloaded_size(item: DMEItem, path: Path) -> None:
+    """Reject a freshly-landed file whose size disagrees with the DME list.
+
+    2026-08-03. The transport check in session.py compares against
+    Content-Length, which a chunked response never sends -- so it cannot be
+    the only guard. TechShare's own list size is an INDEPENDENT oracle and
+    covers that gap: it comes from the DME inventory rather than the
+    transfer, so it also catches a host that lies about the length.
+
+    Must run BEFORE ZIP extraction or media conversion, both of which
+    legitimately change the size on disk.
+
+    On mismatch the bytes are moved back to `<name>.partial` and the error
+    is raised. That matters as much as the raise: a short file left at the
+    real name reads as PRESENT to `is_present_in_portal`, which only tests
+    existence -- so it would count as landed evidence forever. As .partial
+    it is invisible to that check and a retry can resume it.
+    """
+    window = expected_size_range(item)
+    if window is None:
+        return                              # nothing to check against
+    try:
+        actual = path.stat().st_size
+    except OSError:
+        return                              # a missing file is the caller's problem
+    low, high = window
+    if low <= actual <= high:
+        return
+    quarantined = path.with_suffix(path.suffix + ".partial")
+    try:
+        os.replace(path, quarantined)
+    except OSError as e:
+        log.warning("couldn't quarantine short download %s: %s", path.name, e)
+    raise ShortDownloadError(
+        f"{item.name}: landed {actual} bytes, TechShare lists {item.size} "
+        f"(expected {low}-{high}) — kept as .partial, not stored as evidence"
+    )
+
+
 def staged_copy_is_complete(item: DMEItem, path: Path) -> bool:
     """True when `path` already holds a byte-complete copy of `item`.
 
