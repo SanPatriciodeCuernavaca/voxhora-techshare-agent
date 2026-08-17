@@ -111,6 +111,18 @@ def write_pc_affidavit(
     return target
 
 
+def _member_basename(member: str) -> str:
+    """Last path segment of a ZIP entry name, treating BOTH '/' and '\\' as
+    separators. The ZIP spec mandates '/', but Windows-built archives store
+    '\\' (2026-08-16: the Panasonic ICV in-car package on Cac-Che
+    D1DC26301127) — and on macOS '\\' is an ordinary filename character, so
+    without this the whole internal path became ONE backslash-laden
+    filename, which Dropbox rejects (path/malformed_path) on every upload
+    pass forever. Returns "" for directory markers in either form; callers
+    must skip those."""
+    return member.replace("\\", "/").rsplit("/", 1)[-1]
+
+
 def extract_zip_inplace(zip_path: Path) -> int:
     """Extract a ZIP archive into a SUBFOLDER named after it (2026-07-04),
     flattening the archive's internal directory structure inside that
@@ -144,11 +156,12 @@ def extract_zip_inplace(zip_path: Path) -> int:
     extracted = 0
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            members = [m for m in zf.namelist() if not m.endswith("/") and Path(m).name]
+            members = [m for m in zf.namelist()
+                       if not m.endswith("/") and _member_basename(m)]
             if members:
                 subdir.mkdir(exist_ok=True)
             for member in members:
-                name = Path(member).name
+                name = _member_basename(member)
                 target = subdir / name
                 counter = 2
                 while target.exists():

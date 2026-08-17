@@ -127,6 +127,32 @@ def test_extract_empty_zip_creates_no_subfolder(tmp_path):
     assert not (tmp_path / "empty").exists()
 
 
+def test_extract_windows_backslash_members_get_clean_basenames(tmp_path):
+    """2026-08-16 (Cac-Che, D1DC26301127) — Windows-built in-car video ZIPs
+    store entry names with '\\' separators (non-conformant; the ZIP spec
+    mandates '/'). PosixPath treats '\\' as an ordinary filename character,
+    so the whole internal path became ONE flat filename with literal
+    backslashes — and Dropbox rejects every such path (malformed_path), so
+    the case stuck at Partial forever. Both separators must flatten to the
+    last segment; directory markers in backslash form must be skipped."""
+    z = tmp_path / "260371648-in-car.zip"
+    _make_zip(z, {
+        "260371648-in-car\\ICV\\AVViewerConfig.xml": b"cfg",
+        "260371648-in-car\\ICV\\sub\\clip_00m.xml": b"meta",
+        "mixed/sep\\report.pdf": b"R",          # mixed separators in one entry
+        "junkdir\\": b"",                       # directory marker, backslash form
+        "a\\1.png": b"first",
+        "b\\1.png": b"second",                  # basename collision after flatten
+    })
+    assert extract_zip_inplace(z) == 5
+    sub = tmp_path / "260371648-in-car"
+    names = sorted(p.name for p in sub.iterdir())
+    assert names == ["1.png", "1_2.png", "AVViewerConfig.xml", "clip_00m.xml", "report.pdf"]
+    assert not any("\\" in n for n in names)
+    # collision payloads both survive, same rule as the '/' collision test
+    assert {(sub / "1.png").read_bytes(), (sub / "1_2.png").read_bytes()} == {b"first", b"second"}
+
+
 # ------------------------------------------- .msg → .txt companions (2026-07-04)
 
 from voxhora_techshare_agent.storage import convert_msg_to_text
