@@ -458,7 +458,25 @@ def cmd_process_email(args: argparse.Namespace) -> int:
     log.info("parsed event: type=%s cause=%s", event.event_type, event.cause_number)
 
     if event.event_type == "unknown":
-        log.info("unknown event type; nothing to do (caller should still green-flag)")
+        # 2026-08-17 (Rodriguez Vasquez) — an unrecognized email is still a
+        # signal the county knows this cause. The 08-15 "Attorney of record"
+        # emails named both of Julio's causes and were discarded while the
+        # proactive add-cause at case creation had died (exit 1) — so nothing
+        # ever cached the causes and every later refresh skipped. Registration
+        # ONLY: resolve + cache the cause so a future DME ping can fetch its
+        # PC. Never list DME or download from an unknown email, and never
+        # fail it — exit 0 keeps the caller green-flagging (no retry loops).
+        if event.cause_number and not _resolve_case(event.cause_number):
+            try:
+                session = TechShareSession()
+                session.ensure_authenticated()
+                if _resolve_and_cache_cause(event.cause_number, session):
+                    log.info("unknown event; cause %s registered in cache (no fetch)", event.cause_number)
+            except Exception as e:
+                log.warning("unknown event; registration attempt for %s failed: %s", event.cause_number, e)
+        # Subject logged so the county's unrecognized traffic types are
+        # learnable instead of blind-discarded (Patrick, 2026-08-17).
+        log.info("unknown event type (subject=%r); nothing else to do (caller should still green-flag)", args.subject)
         storage.record_run_result(mode="process-email", cause_number=event.cause_number, event_type="unknown")
         return 0
 
