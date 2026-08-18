@@ -327,13 +327,11 @@ def cmd_add_cause(args: argparse.Namespace) -> int:
 
     # Write to case_uuid_cache.json (same shape as the bulk-seeded
     # entries: cause → {case_uuid, service_id, backend_port}).
-    cache = storage.load_case_cache()
-    cache[cause] = {
+    storage.upsert_case_cache_entry(cause, {
         "case_uuid": case_uuid,
         "service_id": service_id,
         "backend_port": backend_port,
-    }
-    storage.atomic_write_json(config.case_uuid_cache_path(), cache)
+    })
 
     print(f"OK — {cause} added to cache (UUID {case_uuid}, port {backend_port})")
     return 0
@@ -394,10 +392,8 @@ def _resolve_and_cache_cause(cause: str, session) -> dict | None:
     if not case_uuid:
         return None
 
-    cache = storage.load_case_cache()
     entry = {"case_uuid": case_uuid, "service_id": service_id, "backend_port": backend_port}
-    cache[cause] = entry
-    storage.atomic_write_json(config.case_uuid_cache_path(), cache)
+    storage.upsert_case_cache_entry(cause, entry)
     log.info("self-heal: resolved + cached %s (UUID %s, port %d)", cause, case_uuid, backend_port)
     return entry
 

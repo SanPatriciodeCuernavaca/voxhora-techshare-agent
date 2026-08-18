@@ -7,6 +7,7 @@ process is killed mid-download.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -992,6 +993,32 @@ def canonical_cause(raw: str) -> str:
     TechShareBackfillEngine.canonicalCause on the Swift side.
     """
     return "".join(ch for ch in raw.upper() if ch.isalnum())
+
+
+def upsert_case_cache_entry(cause: str, entry: dict, username: str | None = None) -> None:
+    """Add/update ONE cause in the case-uuid cache, under an exclusive
+    cross-process lock.
+
+    2026-08-18 (John Purgason, C1CR26205548) — every multi-cause appointment
+    spawns add-cause once PER CAUSE, simultaneously. The write used to be
+    load-whole-file → add my cause → rewrite-whole-file: both processes
+    loaded, each wrote its own cause, and the last writer ERASED the
+    sibling's entry. -548 lost its registration exactly that way; refresh
+    said "not in cache" forever and no PC could ever auto-fetch, while its
+    sibling -549 sat registered beside it. The flock makes read-merge-write
+    one indivisible step across processes; the write itself stays
+    atomic_write_json (crash-safe temp + rename), so a killed process can
+    never leave a half-written cache."""
+    path = config.case_uuid_cache_path(username)
+    lock_path = path.with_suffix(".lock")
+    with open(lock_path, "w") as lock_fh:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        try:
+            cache = load_case_cache(username)
+            cache[cause] = entry
+            atomic_write_json(path, cache)
+        finally:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
 
 
 def lookup_case(cause_number: str, username: str | None = None) -> dict | None:
