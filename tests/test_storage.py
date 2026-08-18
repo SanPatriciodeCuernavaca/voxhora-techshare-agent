@@ -153,6 +153,47 @@ def test_extract_windows_backslash_members_get_clean_basenames(tmp_path):
     assert {(sub / "1.png").read_bytes(), (sub / "1_2.png").read_bytes()} == {b"first", b"second"}
 
 
+def test_extract_zip_with_dropbox_hostile_stem_creates_clean_subfolder(tmp_path):
+    """2026-08-17 (Rodriguez Vasquez C1CR26209777) — the county named a ZIP
+    'Photos(Count=46)_TCSO_262170003 .zip' (space before .zip), so the
+    extraction folder ended in a trailing space. Dropbox rejects any path
+    component ending in a space or period (malformed_path), so 46 arrest
+    photos + the table of contents retried and failed forever. The
+    extraction folder must be Dropbox-safe."""
+    z = tmp_path / "Photos(Count=46)_TCSO_262170003 .zip"
+    _make_zip(z, {"photo1.jpg": b"P"})
+    assert extract_zip_inplace(z) == 1
+    assert (tmp_path / "Photos(Count=46)_TCSO_262170003" / "photo1.jpg").read_bytes() == b"P"
+    assert not any(p.name != p.name.rstrip(" .") for p in tmp_path.iterdir() if p.is_dir())
+
+
+def test_extract_members_with_dropbox_hostile_names_are_sanitized(tmp_path):
+    """Same class, member level: names ending in space/period and control
+    characters are all Dropbox-rejected. Broad rule, not per-symptom."""
+    z = tmp_path / "records.zip"
+    _make_zip(z, {
+        "a.jpg ": b"A",          # trailing space
+        "b.pdf.": b"B",          # trailing period
+        "bad\x01name.txt": b"C", # control character
+        " c.png": b"D",          # leading space
+    })
+    assert extract_zip_inplace(z) == 4
+    names = sorted(p.name for p in (tmp_path / "records").iterdir())
+    assert names == ["a.jpg", "b.pdf", "bad_name.txt", "c.png"]
+
+
+def test_present_when_zip_extracted_folder_was_sanitized(monkeypatch, tmp_path):
+    """The presence check's extracted-folder candidate must recognize the
+    SANITIZED folder for a raw hostile ZIP name — otherwise every such ZIP
+    hits the 'seen but NOT present' loop and re-downloads on every run
+    (the Gomez failure shape, via the new sanitizer)."""
+    d = _portal(monkeypatch, tmp_path)
+    (d / "Photos(Count=46)_TCSO_262170003").mkdir()
+    assert storage.is_present_in_portal(
+        _dme("Photos(Count=46)_TCSO_262170003 .zip"), "C1CR26203183"
+    )
+
+
 # ------------------------------------------- .msg → .txt companions (2026-07-04)
 
 from voxhora_techshare_agent.storage import convert_msg_to_text

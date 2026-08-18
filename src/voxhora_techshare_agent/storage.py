@@ -111,6 +111,25 @@ def write_pc_affidavit(
     return target
 
 
+def _dropbox_safe_component(name: str) -> str:
+    """Make one path component acceptable to Dropbox. Two live incidents in
+    two days proved the county ships names Dropbox rejects outright
+    (path/malformed_path), each stalling a case's upload forever:
+      * 2026-08-16 Cac-Che — backslash-laden member names (handled by the
+        separator split in _member_basename);
+      * 2026-08-17 Rodriguez Vasquez — a ZIP named '… .zip', whose
+        extraction FOLDER therefore ended in a trailing space; 46 arrest
+        photos + the table of contents failed five retries.
+    So this is the CLASS rule, not a per-symptom patch: strip leading
+    spaces and trailing spaces/periods (Dropbox rejects components ending
+    in either), and replace control characters. Applied only to names WE
+    derive (extraction folders + ZIP members) — never to top-level item
+    names, which the resume/presence machinery matches verbatim. Returns
+    "" when nothing survives; callers must fall back or skip."""
+    cleaned = "".join("_" if ord(ch) < 0x20 else ch for ch in name)
+    return cleaned.lstrip(" ").rstrip(" .")
+
+
 def _member_basename(member: str) -> str:
     """Last path segment of a ZIP entry name, treating BOTH '/' and '\\' as
     separators. The ZIP spec mandates '/', but Windows-built archives store
@@ -118,9 +137,10 @@ def _member_basename(member: str) -> str:
     D1DC26301127) — and on macOS '\\' is an ordinary filename character, so
     without this the whole internal path became ONE backslash-laden
     filename, which Dropbox rejects (path/malformed_path) on every upload
-    pass forever. Returns "" for directory markers in either form; callers
-    must skip those."""
-    return member.replace("\\", "/").rsplit("/", 1)[-1]
+    pass forever. The segment is then made Dropbox-safe (2026-08-17,
+    trailing-space class). Returns "" for directory markers in either form;
+    callers must skip those."""
+    return _dropbox_safe_component(member.replace("\\", "/").rsplit("/", 1)[-1])
 
 
 def extract_zip_inplace(zip_path: Path) -> int:
@@ -152,7 +172,13 @@ def extract_zip_inplace(zip_path: Path) -> int:
     second collision; 427 of Richardson's members were lost that way,
     recoverable only because the original ZIP is preserved.)
     """
-    subdir = zip_path.parent / zip_path.stem
+    # 2026-08-17 — the folder is named after the ZIP, so a county ZIP named
+    # '… .zip' produced a trailing-space folder Dropbox rejects (Rodriguez
+    # Vasquez C1CR26209777: 46 photos stuck through five retries). Sanitize
+    # the DERIVED folder name only; the ZIP's own on-disk name stays
+    # verbatim (resume/presence match it exactly). is_present_in_portal's
+    # extracted-folder candidate includes this sanitized form.
+    subdir = zip_path.parent / (_dropbox_safe_component(zip_path.stem) or zip_path.stem)
     extracted = 0
     try:
         with zipfile.ZipFile(zip_path) as zf:
@@ -277,6 +303,15 @@ def is_present_in_portal(item: DMEItem, cause_number: str) -> bool:
     stem = Path(name).stem
     if name.lower().endswith(".zip"):
         candidates = [name, f".{name}", stem]      # original, dot-hidden, extracted folder
+        # 2026-08-17 — extraction folders are Dropbox-sanitized now, so a
+        # hostile-named ZIP ('… .zip') extracts to the CLEAN folder. Without
+        # this candidate the raw stem misses and the item enters the
+        # 'seen but NOT present' loop: re-downloaded on every run (the
+        # Gomez shape, via the sanitizer). Superset — old raw-named
+        # extractions still match through `stem`.
+        safe_stem = _dropbox_safe_component(stem)
+        if safe_stem and safe_stem != stem:
+            candidates.append(safe_stem)
     else:
         candidates = [name, f"{stem}.mp4", f"{stem}.m4a"]   # original or converted sibling
 
