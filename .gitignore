@@ -11,3 +11,6 @@ dist/
 .idea/
 .vscode/
 *.log
+
+# fablize goal-tracking scratch state — session-local, never shared
+.fablize/
