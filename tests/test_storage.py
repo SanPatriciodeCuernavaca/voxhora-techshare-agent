@@ -434,13 +434,27 @@ class _FakeItem:
     name = "PC Affidavit.pdf"
 
 
-def test_write_pc_affidavit_skips_existing_by_default(monkeypatch, tmp_path):
+def test_write_pc_affidavit_skips_an_identical_copy_by_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "dropbox_inbox", lambda: tmp_path)
+    (tmp_path / "C1CR26204167.pdf").write_bytes(b"the-county-pdf")
+    before = (tmp_path / "C1CR26204167.pdf").stat().st_mtime_ns
+
+    storage.write_pc_affidavit(_FakeItem(), b"the-county-pdf", "C1CR26204167", pc_items=[])
+
+    assert (tmp_path / "C1CR26204167.pdf").stat().st_mtime_ns == before, "an identical re-share is left alone"
+
+
+def test_write_pc_affidavit_never_drops_different_bytes(monkeypatch, tmp_path):
+    """2026-09-24: an older drop with other bytes used to keep the name and the
+    new PC was skipped, marked seen and never delivered. Now both reach the
+    inbox: the new one at the name, the old one under a sibling name."""
     monkeypatch.setattr(config, "dropbox_inbox", lambda: tmp_path)
     (tmp_path / "C1CR26204167.pdf").write_bytes(b"the-old-drop")
 
-    storage.write_pc_affidavit(_FakeItem(), b"the-county-pdf", "C1CR26204167")
+    storage.write_pc_affidavit(_FakeItem(), b"the-county-pdf", "C1CR26204167", pc_items=[])
 
-    assert (tmp_path / "C1CR26204167.pdf").read_bytes() == b"the-old-drop"
+    assert (tmp_path / "C1CR26204167.pdf").read_bytes() == b"the-county-pdf"
+    assert sorted(p.read_bytes() for p in tmp_path.glob("*.pdf")) == [b"the-county-pdf", b"the-old-drop"]
 
 
 def test_write_pc_affidavit_force_overwrites(monkeypatch, tmp_path):
@@ -448,7 +462,7 @@ def test_write_pc_affidavit_force_overwrites(monkeypatch, tmp_path):
     (tmp_path / "C1CR26204167.pdf").write_bytes(b"the-old-drop")
 
     storage.write_pc_affidavit(
-        _FakeItem(), b"the-county-pdf", "C1CR26204167", force=True
+        _FakeItem(), b"the-county-pdf", "C1CR26204167", force=True, pc_items=[]
     )
 
     assert (tmp_path / "C1CR26204167.pdf").read_bytes() == b"the-county-pdf"
@@ -457,7 +471,7 @@ def test_write_pc_affidavit_force_overwrites(monkeypatch, tmp_path):
 def test_write_pc_affidavit_writes_when_absent(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "dropbox_inbox", lambda: tmp_path)
 
-    out = storage.write_pc_affidavit(_FakeItem(), b"the-county-pdf", "C1CR26204167")
+    out = storage.write_pc_affidavit(_FakeItem(), b"the-county-pdf", "C1CR26204167", pc_items=[])
 
     assert out.read_bytes() == b"the-county-pdf"
 

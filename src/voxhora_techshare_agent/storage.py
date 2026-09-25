@@ -8,6 +8,7 @@ process is killed mid-download.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -16,7 +17,7 @@ import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from . import config
 from .models import DMEItem, PleaOffer
@@ -83,33 +84,180 @@ def dme_fingerprint(item: DMEItem) -> str:
 # ----- file outputs -----
 
 
+def pc_inbox_filename(
+    item: DMEItem, cause_number: str, pc_items: Iterable[DMEItem] | None = None
+) -> str:
+    """The Bulk_Inbox filename for one PC-type item of `cause_number`.
+
+    `pc_items` is every PC-type item TechShare lists for the cause (the
+    item itself may be among them). One item: `<cause>.pdf`, as always.
+    Two or more: each gets its own name, `<cause> item-<id>.pdf`, where the
+    id is a short hash of the item's fingerprint, so the same item keeps
+    the same name on every run.
+
+    2026-09-24 (Giovany Vazquez, C1CR25501953): TechShare typed three items
+    "PC Affidavit / Arrest Warrant" — the PC, a second affidavit and the
+    Order of Commitment. All three were written to `<cause>.pdf` within
+    half a second; with --force-pc the last write won, so the watcher only
+    ever saw the commitment order, rejected it (no PC markers) and the real
+    PC never reached the case, on every pass for two weeks. Without force
+    the first write wins instead, which loses the others the same way. The
+    watcher decides which file is the PC (text markers, OCR); the agent's
+    job is only to deliver every one.
+
+    The id is a hash, never TechShare's own item name: those carry the
+    defendant's name ("Vazquez PC.pdf"), and the watcher writes inbox
+    filenames into the shared ~/Voxhora_Logs trace (PII rule, audit M1).
+    The watcher still reads the cause from the front of the name
+    (TravisCountyPCAffidavitDetector strips spaces and hyphens, then finds
+    the first C1CR/D1DC + 8 digits), and "item-" puts letters between the
+    cause and the hex so no digits run on from the cause number.
+    """
+    siblings = list(pc_items or ())
+    if not siblings:
+        return f"{cause_number}.pdf"
+    fingerprint = dme_fingerprint(item)
+    others = {dme_fingerprint(p) for p in siblings} - {fingerprint}
+    if not others:
+        return f"{cause_number}.pdf"
+
+    def item_id(fp: str, length: int) -> str:
+        return hashlib.sha256(fp.encode("utf-8")).hexdigest()[:length]
+
+    # Eight hex characters; the full hash on the (theoretical) chance two
+    # siblings share a prefix, because a shared name is this bug again.
+    length = 8
+    if any(item_id(o, length) == item_id(fingerprint, length) for o in others):
+        length = 64
+    return f"{cause_number} item-{item_id(fingerprint, length)}.pdf"
+
+
 def write_pc_affidavit(
-    item: DMEItem, content: bytes, cause_number: str, force: bool = False
+    item: DMEItem,
+    content: bytes,
+    cause_number: str,
+    force: bool = False,
+    *,
+    pc_items: Iterable[DMEItem],
 ) -> Path:
     """Write a PC Affidavit PDF into Voxhora's Bulk_Inbox for AutoIntakeWatcher.
 
-    Filename convention: <cause-number>.pdf (if not already named that way)
-    Voxhora's existing AutoIntakeWatcher matches D1DC*/C1CR* patterns; the
-    cause-number-named file ensures the pipeline attributes to the right case.
+    Filename: see `pc_inbox_filename` — `<cause-number>.pdf` for the usual
+    single PC, one distinct cause-prefixed name per item when TechShare
+    lists several. `pc_items` (every PC-type item of the cause in TechShare's
+    listing) is required and keyword-only: a call site that forgot it would
+    quietly name every item `<cause>.pdf` again, which is the bug.
+    Voxhora's AutoIntakeWatcher matches D1DC*/C1CR* patterns; the
+    cause-number-prefixed file ensures the pipeline attributes to the right case.
 
     `force` overwrites a PDF already sitting in the inbox. Without it a
     --force-pc re-fetch is a silent no-op whenever the previous drop is
     still on disk: the bytes are downloaded and then thrown away here. That
     is the SECOND gate on the same repair (the first being the seen-set),
     and both have to open for the 87 stand-in cases to get their real PC.
+    Since each item has its own name, force only ever overwrites that same
+    item's earlier copy, never a sibling.
     """
     inbox = config.dropbox_inbox()
-    target = inbox / f"{cause_number}.pdf"
-    # If the file already exists, don't overwrite — TechShare may re-share
-    # an identical PC; leave the original timestamp/processing intact.
+    # The canonical join key (C1CR/D1DC + 8 digits), as every app caller
+    # already passes it; a hand-typed dashed cause would otherwise give names
+    # the watcher's sibling check does not recognize.
+    cause = canonical_cause(cause_number)
+    target = inbox / pc_inbox_filename(item, cause, pc_items)
+    plain = inbox / f"{cause}.pdf"
+    # An identical copy already on disk is left alone (TechShare re-shares the
+    # same PC; keep the original timestamp and processing). Different bytes
+    # under the same name are never silently dropped any more: without force
+    # the file there is moved to a sibling name of its own first, so both
+    # reach the watcher (2026-09-24 review: a lone real PC was skipped, marked
+    # seen and never delivered because an older leftover held its name).
     if target.exists() and not force:
-        log.info("PC %s already on disk; skipping write", target.name)
-        return target
-    if target.exists():
-        log.info("PC %s already on disk; overwriting (force)", target.name)
-    atomic_write_bytes(target, content)
-    log.info("wrote PC affidavit: %s (%d bytes)", target, len(content))
+        if target.read_bytes() == content:
+            log.info("PC %s already on disk; skipping write", target.name)
+        else:
+            _retire_to_content_name(target, cause)
+            atomic_write_bytes(target, content)
+            log.info("wrote PC affidavit: %s (%d bytes)", target, len(content))
+    else:
+        if target.exists():
+            log.info("PC %s already on disk; overwriting (force)", target.name)
+        atomic_write_bytes(target, content)
+        log.info("wrote PC affidavit: %s (%d bytes)", target, len(content))
+    # Leftovers are retired only AFTER this item's own copy is on disk, and a
+    # leftover is deleted only when that copy holds the same bytes, so a
+    # failed or interrupted write never removes the last copy of anything.
+    if target != plain:
+        if plain.exists():
+            _adopt_plain_leftover(plain, target, cause)
+        _drop_renamed_copy_of(target, cause, inbox)
     return target
+
+
+def _adopt_plain_leftover(plain: Path, delivered: Path, cause_number: str) -> None:
+    """Retire a `<cause>.pdf` still in the inbox once the cause has several
+    PC-type items (2026-09-24).
+
+    It was written when the cause had one item, or by the agent before this
+    fix, and nothing re-delivers or removes it. Left under the plain name it
+    is dangerous: the Mac watcher gives a plain-named file the older rules,
+    under which a marked one replaces a filed PC, while item-named siblings
+    never do. So: if `delivered` (this item's copy, already on disk) holds
+    the same bytes, the leftover is that item's earlier copy and is removed;
+    otherwise it gets a sibling name of its own (the full hash of its bytes),
+    so the watcher treats it as one of the siblings. Best-effort: a failure
+    is logged, never raised.
+    """
+    try:
+        old = plain.read_bytes()
+        if delivered.exists() and delivered.read_bytes() == old:
+            plain.unlink()
+            log.info("removed %s: the same bytes are in %s", plain.name, delivered.name)
+            return
+        _retire_to_content_name(plain, cause_number)
+    except OSError as e:
+        log.warning("could not retire leftover %s: %s", plain.name, e)
+
+
+def _retire_to_content_name(path: Path, cause_number: str) -> Path:
+    """Move `path` to "<cause> item-<full sha256 of its bytes>.pdf", a sibling
+    name the watcher never lets replace a filed PC. The FULL hash, never the
+    8-character form items use, so a retired file can never take the name a
+    sibling not yet written will need (review 2026-09-24). A file already
+    there holds the same bytes by construction, so `path` is simply removed.
+    Raises OSError, so a caller never marks as delivered what it could not
+    move out of the way."""
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    renamed = path.with_name(f"{cause_number} item-{digest}.pdf")
+    if renamed.exists():
+        path.unlink()
+        log.info("removed %s: the same bytes are already in %s", path.name, renamed.name)
+    else:
+        os.replace(path, renamed)
+        log.info("moved %s to %s (one of several PC-type items)", path.name, renamed.name)
+    return renamed
+
+
+def _drop_renamed_copy_of(delivered: Path, cause_number: str, inbox: Path) -> None:
+    """Remove a leftover that `_retire_to_content_name` renamed (this run or
+    an earlier one) when it holds exactly the bytes now in `delivered`, this
+    item's own copy. The renamed leftover's name is the full hash of its
+    bytes, so only that one path can be it; a twin TechShare lists under
+    another id keeps its own name. Best-effort, like the adoption itself.
+    """
+    try:
+        content = delivered.read_bytes()
+    except OSError as e:
+        log.warning("could not read %s to check for a leftover copy: %s", delivered.name, e)
+        return
+    candidate = inbox / f"{cause_number} item-{hashlib.sha256(content).hexdigest()}.pdf"
+    if candidate == delivered or not candidate.exists():
+        return
+    try:
+        if candidate.read_bytes() == content:
+            candidate.unlink()
+            log.info("removed %s: the same bytes are in %s", candidate.name, delivered.name)
+    except OSError as e:
+        log.warning("could not remove leftover copy %s: %s", candidate.name, e)
 
 
 def _dropbox_safe_component(name: str) -> str:

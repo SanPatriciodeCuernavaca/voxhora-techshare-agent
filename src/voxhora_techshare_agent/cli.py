@@ -529,16 +529,37 @@ def cmd_process_email(args: argparse.Namespace) -> int:
         log.info("DME items=%d  PC affidavits=%d", len(dme_items), len(pcs))
 
         seen = storage.load_seen_dme_ids()
-        for pc in pcs:
-            fp = storage.dme_fingerprint(pc)
-            if fp in seen:
-                log.info("PC %s already downloaded (fingerprint %s); skipping", pc.name, fp)
-                continue
-            data = client.download_dme_file(service_id, pc)
-            storage.write_pc_affidavit(pc, data, event.cause_number)
-            seen.add(fp)
-            pcs_downloaded += 1
-        storage.save_seen_dme_ids(seen)
+        # 2026-09-24 — one item's failure no longer stops the rest: every
+        # PC-type item is delivered on its own, and the real PC can be listed
+        # after a broken one. The seen-set is saved even when one fails, and
+        # the email still fails (exit 1) so the caller retries it.
+        pc_failures = 0
+        try:
+            for pc in pcs:
+                fp = storage.dme_fingerprint(pc)
+                if fp in seen:
+                    log.info("PC %s already downloaded (fingerprint %s); skipping", pc.name, fp)
+                    continue
+                try:
+                    data = client.download_dme_file(service_id, pc)
+                    storage.write_pc_affidavit(pc, data, event.cause_number, pc_items=pcs)
+                except Exception as e:
+                    pc_failures += 1
+                    log.error("PC %s failed: %s", fp, e)
+                    continue
+                seen.add(fp)
+                pcs_downloaded += 1
+        finally:
+            storage.save_seen_dme_ids(seen)
+        if pc_failures:
+            storage.record_run_result(
+                mode="process-email",
+                cause_number=event.cause_number,
+                event_type=event.event_type,
+                pcs_downloaded=pcs_downloaded,
+                error=f"{pc_failures} PC item(s) failed",
+            )
+            return 1
 
     elif event.event_type == "plea_offer_updated":
         plea = client.get_plea_offer(service_id, case)
@@ -666,7 +687,9 @@ def cmd_fetch(args: argparse.Namespace) -> int:
                 # (Voxhora's AutoIntakeWatcher) wants bytes for PDFKit.
                 # PCs are PDFs, max few MB; in-memory load is fine.
                 data = client.download_dme_file(service_id, item)
-                written_path = storage.write_pc_affidavit(item, data, cause_number)
+                written_path = storage.write_pc_affidavit(
+                    item, data, cause_number, pc_items=client.pc_affidavits_in(dme_items)
+                )
                 size_bytes = len(data)
             else:
                 # Stream everything else directly to disk — videos can
@@ -876,7 +899,9 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
         try:
             if item.is_pc_affidavit:
                 data = client.download_dme_file(service_id, item)
-                written_path = storage.write_pc_affidavit(item, data, cause_number)
+                written_path = storage.write_pc_affidavit(
+                    item, data, cause_number, pc_items=client.pc_affidavits_in(dme_items)
+                )
                 size_bytes = len(data)
             else:
                 written_path = storage.case_discovery_target_path(
@@ -1197,15 +1222,17 @@ def _refresh_one_case(
                 client.session.reauthenticate()
                 data = client.download_dme_file(service_id, pc)
             except Exception as e:
-                result["error"] = f"PC download failed: {e}"
-                break
+                # 2026-09-24 — keep going: every PC-type item is delivered on
+                # its own, and the real PC may be listed after a broken one.
+                result["error"] = result["error"] or f"PC download failed: {e}"
+                continue
         try:
-            storage.write_pc_affidavit(pc, data, cause_number, force=force_pc)
+            storage.write_pc_affidavit(pc, data, cause_number, force=force_pc, pc_items=pcs)
             seen.add(fp)
             result["pcs_downloaded"] += 1
         except Exception as e:
-            result["error"] = f"PC write failed: {e}"
-            break
+            result["error"] = result["error"] or f"PC write failed: {e}"
+            continue
     storage.save_seen_dme_ids(seen)
 
     # Plea offer (only if the link is present on the case)

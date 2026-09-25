@@ -69,6 +69,8 @@ voxhora-techshare-agent status   # verifies session
 
 Voxhora-Mac's `AutoIntakeWatcher` is configured (in Settings → Auto-intake folders) to watch `~/Dropbox/Voxhora/Bulk_Inbox/`. The agent writes PC affidavit PDFs there; AutoIntakeWatcher's existing Phase 1 pipeline OCRs them, runs Haiku synopsis, attaches to the matching Case in SwiftData, syncs to iPhone/iPad via CloudKit.
 
+PC filenames: `<cause-number>.pdf` when TechShare lists one PC-type item for the cause; when it lists several, each gets its own `<cause-number> item-<hex>.pdf` (a hash of the item's TechShare id, stable across runs) so no item overwrites another, and the watcher decides which one is the PC (`storage.pc_inbox_filename`, 2026-09-24).
+
 Plea offer text is written to `~/Dropbox/Voxhora/Bulk_Inbox/<cause-number>.plea.json` for a separate Voxhora-Mac ingestor that populates `Case.latestPleaOfferText`. (Ingestor TBD — pending Voxhora-Mac side of v1 build.)
 
 ## License
