@@ -160,7 +160,7 @@ class PleaOffer:
 class TechShareEvent:
     """Parsed TechShare notification email body."""
 
-    event_type: str  # "dme_discoverable" | "plea_offer_updated" | "unknown"
+    event_type: str  # "dme_discoverable" | "plea_offer_updated" | "attorney_of_record" | "unknown"
     cause_number: str  # extracted via regex (C1CR* or D1DC*)
     defendant_name: str | None = None  # only present in DME emails
     filenames: tuple[str, ...] = ()  # discovery filenames named in body (DME emails)

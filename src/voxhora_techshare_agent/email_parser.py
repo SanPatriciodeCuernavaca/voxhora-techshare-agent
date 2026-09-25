@@ -1,6 +1,6 @@
 """Parse TechShareProsecutor@traviscountytx.gov notification emails.
 
-Two event types observed in production (samples captured 2026-05-25 night):
+Event types observed in production (samples captured 2026-05-25 night):
 
   1. "DME made discoverable" — structured key/value body + filename list:
 
@@ -21,6 +21,10 @@ Two event types observed in production (samples captured 2026-05-25 night):
          Hi Richard,
 
          Case C1CR26203830 - An extended Plea Offer has been updated.
+
+  3. "Attorney of record" (2026-09-25) — recognized by its subject,
+     "Attorney of record in case # D1DC26300000 (LAST, FIRST)". Arrives
+     hours after the appointment, once TechShare has the case posted.
 
 Returns a TechShareEvent dataclass. Caller dispatches by event_type.
 """
@@ -44,6 +48,15 @@ _DME_TRIGGER_RE = re.compile(r"DME\s+(was|were)\s+made\s+discoverable", re.IGNOR
 
 # Plea-offer trigger phrase
 _PLEA_TRIGGER_RE = re.compile(r"Plea\s+Offer\s+has\s+been\s+updated", re.IGNORECASE)
+
+# "Attorney of record" notice — matched on the SUBJECT only, whose wording is
+# fixed ("Attorney of record in case # D1DC26300000 (LAST, FIRST)" — every
+# one of the 140+ seen Aug–Sep 2026). The body is not trusted for this: other notices (e.g.
+# "A Case has been Disposed") could mention "attorney of record" in passing.
+# Not anchored: a firm's mail gateway may prefix "[EXTERNAL]" or "FW:". No
+# other TechShare subject family (Disposed, Charge Rejected, Discovery Notes
+# Updated, mitigation, DME, plea) contains the phrase.
+_ATTORNEY_OF_RECORD_SUBJECT_RE = re.compile(r"\bAttorney\s+of\s+record\s+in\s+case\b", re.IGNORECASE)
 
 # Defendant name extractor — "Defendant Name: LAST, FIRST MIDDLE"
 _DEFENDANT_RE = re.compile(r"Defendant\s+Name\s*:\s*([^\r\n]+)", re.IGNORECASE)
@@ -91,6 +104,17 @@ def parse_email_body(body: str, subject: str | None = None) -> TechShareEvent:
             cause_number=cause_number,
             defendant_name=defendant,
             filenames=filenames,
+            raw_subject=subject,
+            raw_body_excerpt=excerpt,
+        )
+
+    if subject and _ATTORNEY_OF_RECORD_SUBJECT_RE.search(subject):
+        # The subject names exactly the case this notice is about; prefer it
+        # over the first cause-shaped token in the body.
+        subject_cause = _CAUSE_RE.search(subject)
+        return TechShareEvent(
+            event_type="attorney_of_record",
+            cause_number=subject_cause.group(1) if subject_cause else cause_number,
             raw_subject=subject,
             raw_body_excerpt=excerpt,
         )

@@ -462,6 +462,9 @@ def cmd_process_email(args: argparse.Namespace) -> int:
         # ONLY: resolve + cache the cause so a future DME ping can fetch its
         # PC. Never list DME or download from an unknown email, and never
         # fail it — exit 0 keeps the caller green-flagging (no retry loops).
+        # (2026-09-25: "Attorney of record" emails now parse as their own
+        # type and DO fetch — see _process_attorney_of_record. This branch
+        # still covers the rest, e.g. "A Case has been Disposed".)
         if event.cause_number and not _resolve_case(event.cause_number):
             try:
                 session = TechShareSession()
@@ -475,6 +478,9 @@ def cmd_process_email(args: argparse.Namespace) -> int:
         log.info("unknown event type (subject=%r); nothing else to do (caller should still green-flag)", args.subject)
         storage.record_run_result(mode="process-email", cause_number=event.cause_number, event_type="unknown")
         return 0
+
+    if event.event_type == "attorney_of_record":
+        return _process_attorney_of_record(event)
 
     if not event.cause_number:
         log.warning("no cause number extracted from email; cannot proceed")
@@ -577,6 +583,87 @@ def cmd_process_email(args: argparse.Namespace) -> int:
         plea_captured=plea_captured,
     )
     return 0
+
+
+# Pause before each attorney-of-record fetch — the same footprint discipline
+# as the app's backfill (2.5 s between cases; TechShare audit-logs every proxy
+# call). A backlog of unflagged notices (first scan on a new Mac has no date
+# cutoff) would otherwise fire full fetches back to back.
+_ATTORNEY_OF_RECORD_PACING_SECONDS = 2.5
+
+
+def _process_attorney_of_record(event) -> int:
+    """"Attorney of record in case # …" — fetch the new case's PC + plea NOW.
+
+    2026-09-25 (Patrick: "why isn't Voxhora doing this on its own"). The
+    add-cause at case creation runs when the appointment letter lands, before
+    the county has posted the case: TechShare answers 404 (48 of 57 in
+    September) and nothing retried. This notice arrives hours later, once the
+    case IS posted — until today it only cached the cause ("no fetch") and
+    the PC waited for a manual backfill. PCs posted BEFORE the appointment
+    never get a "DME made discoverable" email to the new attorney (the four
+    PCs Patrick's manual tap found were posted 6/16–9/23, all before their
+    notices), so this notice is the only automatic moment to fetch them.
+    Now: resolve + cache, then the same light refresh as `refresh` (PC
+    affidavit + plea offer; never video or other discovery).
+
+    No --force-pc: a PC already delivered (at-creation refresh, DME email)
+    is not fetched twice. A case that still lacks its PC for another reason
+    is caught by the app's daily backfill, which does force.
+
+    Always exit 0, login failures included: a problem here must not bounce
+    the email into a retry loop (the daily backfill is the retry). A login
+    failure is recorded, not raised — a non-zero exit re-runs the email every
+    Mail tick, and with a wrong password that is one failed TechShare login
+    per unflagged notice every 5 minutes (account-lockout risk; round-2
+    review). Bad credentials already surface through the DME/plea emails.
+    """
+    cause = event.cause_number
+    if not cause:
+        log.warning("attorney of record email without a cause number; nothing to fetch")
+        _record_quietly(mode="process-email", event_type=event.event_type, error="no_cause")
+        return 0
+    import time
+    time.sleep(_ATTORNEY_OF_RECORD_PACING_SECONDS)
+    try:
+        session = TechShareSession()
+        session.ensure_authenticated()
+        if not (_resolve_case(cause) or _resolve_and_cache_cause(cause, session)):
+            log.info(
+                "attorney of record: %s not resolvable (not posted yet, or TechShare didn't answer); "
+                "the daily backfill will retry", cause,
+            )
+            _record_quietly(mode="process-email", cause_number=cause, event_type=event.event_type, error="not_resolvable")
+            return 0
+        r = _refresh_one_case(cause, TechShareClient(session))
+    except Exception as e:
+        log.warning("attorney of record: fetch for %s failed: %s", cause, e)
+        _record_quietly(mode="process-email", cause_number=cause, event_type=event.event_type, error=str(e))
+        return 0
+    log.info(
+        "attorney of record: %s — PCs +%d, plea %s%s",
+        cause, r["pcs_downloaded"], "captured" if r["plea_captured"] else "none",
+        f" (error: {r['error']})" if r["error"] else "",
+    )
+    _record_quietly(
+        mode="process-email",
+        cause_number=cause,
+        event_type=event.event_type,
+        pcs_downloaded=r["pcs_downloaded"],
+        plea_captured=r["plea_captured"],
+        error=r["error"],
+    )
+    return 0
+
+
+def _record_quietly(**kwargs) -> None:
+    """record_run_result that can't fail the email: a full disk or an
+    unreadable last-run file would otherwise exit 1 and re-run the whole
+    fetch on every Mail tick."""
+    try:
+        storage.record_run_result(**kwargs)
+    except Exception as e:
+        log.warning("could not record run result: %s", e)
 
 
 def cmd_fetch(args: argparse.Namespace) -> int:
