@@ -133,7 +133,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     ac.add_argument("cause_number", help="e.g. C1CR26206319 or D1DC26300823")
 
     pe = sub.add_parser("process-email", help="Process a single TechShare email body from stdin.")
-    pe.add_argument("--subject", default=None, help="Email subject (optional, for logging).")
+    # 2026-10-11 — subjects carry defendant names; on the command line any
+    # user on the Mac can read them with `ps`. Voxhora passes a file in its
+    # private per-scan folder instead; --subject stays for older apps.
+    pe_subject = pe.add_mutually_exclusive_group()
+    pe_subject.add_argument("--subject", default=None, help="Email subject (optional, for logging).")
+    pe_subject.add_argument("--subject-file", default=None,
+                            help="Read the email subject from this file (keeps it off the command line).")
 
     fc = sub.add_parser("fetch", help="On-demand bulk DME pull for one case (videos + all DME).")
     fc.add_argument("cause_number", help="e.g. C1CR26203830 or D1DC23207931")
@@ -450,7 +456,17 @@ def cmd_process_email(args: argparse.Namespace) -> int:
         print("ERROR: empty email body on stdin", file=sys.stderr)
         return 1
 
-    event = parse_email_body(body, subject=args.subject)
+    subject = args.subject
+    subject_file = getattr(args, "subject_file", None)
+    if subject_file is not None:
+        try:
+            with open(subject_file, encoding="utf-8") as fh:
+                subject = fh.read().rstrip("\r\n")
+        except OSError as e:
+            print(f"ERROR: can't read the subject file: {e}", file=sys.stderr)
+            return 1
+
+    event = parse_email_body(body, subject=subject)
     log.info("parsed event: type=%s cause=%s", event.event_type, event.cause_number)
 
     if event.event_type == "unknown":
@@ -475,7 +491,7 @@ def cmd_process_email(args: argparse.Namespace) -> int:
                 log.warning("unknown event; registration attempt for %s failed: %s", event.cause_number, e)
         # Subject logged so the county's unrecognized traffic types are
         # learnable instead of blind-discarded (Patrick, 2026-08-17).
-        log.info("unknown event type (subject=%r); nothing else to do (caller should still green-flag)", args.subject)
+        log.info("unknown event type (subject=%r); nothing else to do (caller should still green-flag)", subject)
         storage.record_run_result(mode="process-email", cause_number=event.cause_number, event_type="unknown")
         return 0
 
