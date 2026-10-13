@@ -31,14 +31,24 @@ log = logging.getLogger(__name__)
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     """Write `data` to `path` atomically (write-to-tmp + rename)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="wb", dir=path.parent, delete=False, prefix=f".{path.name}.", suffix=".tmp"
-    ) as tmp:
-        tmp.write(data)
-        tmp.flush()
-        os.fsync(tmp.fileno())
-        tmp_path = Path(tmp.name)
-    tmp_path.replace(path)
+    # mkstemp creates the temp 0600, like NamedTemporaryFile did.
+    # The temp name is length-bounded: the real name may already be near the
+    # 255-byte filename limit (long county exhibit names, multi-byte letters).
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name[:40]}.", suffix=".tmp")
+    tmp_path = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as tmp:
+            tmp.write(data)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        tmp_path.replace(path)
+    except BaseException:
+        # A cancel (SIGTERM) or a full disk must not leave a dot-temp behind:
+        # in a staging folder it counts as a leftover and holds the case at
+        # "Partial". (A full disk can fail the close itself, so the unlink is
+        # here, after the `with`, not inside it.)
+        _safe_unlink(tmp_path)
+        raise
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -406,13 +416,24 @@ def extract_zip_inplace(zip_path: Path) -> int:
     # extracted-folder candidate includes this sanitized form.
     subdir = zip_path.parent / (_dropbox_safe_component(zip_path.stem) or zip_path.stem)
     extracted = 0
+    # 2026-10-12 — an extraction that does not finish leaves NOTHING behind.
+    # Before, a cancel or error between members left a half-filled folder that
+    # looked like the whole bundle (is_present_in_portal counts the folder) and
+    # the re-run added `_2` duplicates of every member. Each member is written
+    # under a dot-temp (`.*.tmp` — the streaming uploader skips in-flight
+    # temps, so a half-written member can never reach Dropbox) and renamed
+    # into place when complete; if the call doesn't finish, everything it
+    # wrote is removed and the ZIP stays visible for the next run.
+    subdir_created = not subdir.exists()
+    written: list[Path] = []
+    finished = False
     try:
         with zipfile.ZipFile(zip_path) as zf:
             members = [m for m in zf.namelist()
                        if not m.endswith("/") and _member_basename(m)]
             if members:
                 subdir.mkdir(exist_ok=True)
-            for member in members:
+            for index, member in enumerate(members):
                 name = _member_basename(member)
                 target = subdir / name
                 counter = 2
@@ -420,20 +441,41 @@ def extract_zip_inplace(zip_path: Path) -> int:
                     stem, dot, ext = name.rpartition(".")
                     target = subdir / (f"{stem}_{counter}.{ext}" if dot else f"{name}_{counter}")
                     counter += 1
-                with zf.open(member) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
+                # Fixed-length temp name: a member's own name can already be
+                # near the 255-byte filename limit.
+                tmp = subdir / f".{os.getpid()}.{index}.extracting.tmp"
+                try:
+                    with zf.open(member) as src, open(tmp, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    os.replace(tmp, target)
+                except BaseException:
+                    _safe_unlink(tmp)
+                    raise
+                written.append(target)
                 extracted += 1
                 # 2026-07-04 — Outlook emails get a readable .txt companion
                 # so the Portal can display them (the .msg itself is a
                 # binary format no in-app viewer renders).
                 if target.suffix.lower() == ".msg":
-                    convert_msg_to_text(target)
+                    companion = convert_msg_to_text(target)
+                    if companion is not None:
+                        written.append(companion)
+        finished = True
     except zipfile.BadZipFile:
         log.warning("ZIP corrupted, leaving intact: %s", zip_path.name)
         return 0
     except Exception as e:
         log.error("ZIP extract failed for %s: %s", zip_path.name, e)
         return 0
+    finally:
+        if not finished:
+            for f in written:
+                _safe_unlink(f)
+            if subdir_created:
+                try:
+                    subdir.rmdir()          # only if this call made it and it's empty
+                except OSError:
+                    pass
     return extracted
 
 
@@ -478,7 +520,7 @@ def convert_msg_to_text(msg_path: Path) -> Path | None:
                              "open it in Outlook/Finder to get them]")
                 lines.extend(f"  • {n}" for n in attachment_names)
             target = msg_path.with_name(msg_path.name + ".txt")
-            target.write_text("\n".join(lines), encoding="utf-8")
+            atomic_write_text(target, "\n".join(lines))   # never a truncated "readable email"
             return target
         finally:
             msg.close()
@@ -850,25 +892,31 @@ def convert_video_to_playable(video_path: Path) -> Path | None:
         import time
         started = time.monotonic()
         ok = False
-        for codec_args in attempts:
-            remaining = deadline - (time.monotonic() - started)
-            if remaining <= 0:
-                log.warning("conversion deadline (%ss) exhausted for %s",
-                            deadline, video_path.name)
-                break
-            try:
-                result = subprocess.run(
-                    base + codec_args + tail,
-                    capture_output=True, timeout=remaining,
-                )
-                if result.returncode == 0 and tmp.exists() and tmp.stat().st_size > 1024:
-                    ok = True
+        try:
+            for codec_args in attempts:
+                remaining = deadline - (time.monotonic() - started)
+                if remaining <= 0:
+                    log.warning("conversion deadline (%ss) exhausted for %s",
+                                deadline, video_path.name)
                     break
-            except subprocess.TimeoutExpired:
-                log.warning("conversion timed out for %s", video_path.name)
-            except Exception as e:
-                log.warning("conversion attempt errored for %s: %s", video_path.name, e)
+                try:
+                    result = subprocess.run(
+                        base + codec_args + tail,
+                        capture_output=True, timeout=remaining,
+                    )
+                    if result.returncode == 0 and tmp.exists() and tmp.stat().st_size > 1024:
+                        ok = True
+                        break
+                except subprocess.TimeoutExpired:
+                    log.warning("conversion timed out for %s", video_path.name)
+                except Exception as e:
+                    log.warning("conversion attempt errored for %s: %s", video_path.name, e)
+                _safe_unlink(tmp)
+        except BaseException:
+            # Cancel (SIGTERM) mid-encode: subprocess.run has killed ffmpeg;
+            # don't leave its `.converting` temp for the next run to collide with.
             _safe_unlink(tmp)
+            raise
         if not ok:
             _safe_unlink(tmp)
             log.warning("all conversion attempts failed for %s; original left visible",
@@ -1028,23 +1076,29 @@ def convert_audio_to_playable(audio_path: Path) -> Path | None:
         import time
         started = time.monotonic()
         ok = False
-        for codec_args in attempts:
-            remaining = deadline - (time.monotonic() - started)
-            if remaining <= 0:
-                log.warning("audio conversion deadline (%ss) exhausted for %s",
-                            deadline, audio_path.name)
-                break
-            try:
-                result = subprocess.run(base + codec_args + tail,
-                                        capture_output=True, timeout=remaining)
-                if result.returncode == 0 and tmp.exists() and tmp.stat().st_size > 512:
-                    ok = True
+        try:
+            for codec_args in attempts:
+                remaining = deadline - (time.monotonic() - started)
+                if remaining <= 0:
+                    log.warning("audio conversion deadline (%ss) exhausted for %s",
+                                deadline, audio_path.name)
                     break
-            except subprocess.TimeoutExpired:
-                log.warning("audio conversion timed out for %s", audio_path.name)
-            except Exception as e:
-                log.warning("audio conversion attempt errored for %s: %s", audio_path.name, e)
+                try:
+                    result = subprocess.run(base + codec_args + tail,
+                                            capture_output=True, timeout=remaining)
+                    if result.returncode == 0 and tmp.exists() and tmp.stat().st_size > 512:
+                        ok = True
+                        break
+                except subprocess.TimeoutExpired:
+                    log.warning("audio conversion timed out for %s", audio_path.name)
+                except Exception as e:
+                    log.warning("audio conversion attempt errored for %s: %s", audio_path.name, e)
+                _safe_unlink(tmp)
+        except BaseException:
+            # Cancel (SIGTERM) mid-encode: subprocess.run has killed ffmpeg;
+            # don't leave its `.converting` temp for the next run to collide with.
             _safe_unlink(tmp)
+            raise
         if not ok:
             _safe_unlink(tmp)
             log.warning("all audio conversion attempts failed for %s; original left visible",

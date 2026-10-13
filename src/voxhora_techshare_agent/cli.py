@@ -24,7 +24,9 @@ import logging
 import os
 import platform
 import re
+import signal
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -95,6 +97,67 @@ def _scrub(argv: Sequence[str]) -> str:
             continue
         out.append(a)
     return " ".join(out)
+
+
+# ----- SIGTERM (2026-10-12) -----
+#
+# The Mac app SIGTERMs an agent for Cancel, a Portal viewing pause, sleep and
+# quit. Python's default is to die on the spot: no finally blocks, and an
+# ffmpeg converter started by subprocess.run is orphaned — it keeps writing its
+# fixed `.<name>.converting` temp, which the next run's ffmpeg (`-y`, same
+# name) writes too: two writers, the corruption class that left a body-cam
+# video 78% zeros (2026-07-28). Now SIGTERM raises AgentTerminated (a
+# BaseException, so the `except Exception` fail-soft blocks don't swallow it):
+# subprocess.run kills its child on the way out, temp files are unlinked, and
+# the run then dies BY the signal so the app still reads it as a cancel.
+
+
+class AgentTerminated(BaseException):
+    """SIGTERM from the Mac app, unwinding the run so cleanup can happen."""
+
+
+# Cleanup after a cancel normally takes milliseconds (kill + reap ffmpeg,
+# unlink temps). If it ever stalls — e.g. a log write blocked on a full pipe
+# nobody reads — the app's one SIGTERM is already spent and later ones are
+# ignored, so a watchdog ends the process the hard way instead.
+_CLEANUP_WATCHDOG_SECONDS = 15.0
+
+
+def _on_sigterm(signum, frame):
+    # A second SIGTERM must not interrupt the cleanup the first one started
+    # (it would orphan ffmpeg mid kill-and-wait); the watchdog bounds it.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    watchdog = threading.Timer(
+        _CLEANUP_WATCHDOG_SECONDS, lambda: os.kill(os.getpid(), signal.SIGKILL))
+    watchdog.daemon = True
+    watchdog.start()
+    raise AgentTerminated()
+
+
+def _die_by_sigterm() -> None:
+    """After unwinding: exit the way an un-handled SIGTERM would."""
+    logging.shutdown()
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGTERM)
+    os._exit(143)        # only if the re-raised signal somehow didn't end us
+
+
+def _run_guarded(run_id: str, command) -> int:
+    """Run one command with the SIGTERM handler installed, restoring the
+    previous handler afterwards (tests call main() in-process)."""
+    on_main_thread = threading.current_thread() is threading.main_thread()
+    previous = signal.getsignal(signal.SIGTERM) if on_main_thread else None
+    try:
+        if on_main_thread:
+            signal.signal(signal.SIGTERM, _on_sigterm)
+        return command()
+    except AgentTerminated:
+        log.warning("run %s terminated by SIGTERM; cleanup done", run_id)
+        _die_by_sigterm()
+        return 143       # unreachable
+    finally:
+        if on_main_thread:
+            signal.signal(signal.SIGTERM, previous)
 
 
 # ----- entrypoint -----
@@ -290,9 +353,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     # "run ... exit" line was killed, and that is itself the finding — the
     # old behavior left no way to tell a killed run from a clean one.
     try:
-        rc = dispatch[args.command](args)
+        rc = _run_guarded(run_id, lambda: dispatch[args.command](args))
         log.info("run %s exit %s", run_id, rc)
         return rc
+    except AgentTerminated:
+        # The signal landed in the handler's own install/restore window.
+        log.warning("run %s terminated by SIGTERM", run_id)
+        _die_by_sigterm()
+        return 143
     except TechShareAuthError as e:
         log.error("run %s exit 2 (auth): %s", run_id, e)
         print(f"AUTH ERROR: {e}", file=sys.stderr)
