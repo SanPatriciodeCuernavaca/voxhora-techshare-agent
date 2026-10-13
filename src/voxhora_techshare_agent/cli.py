@@ -58,8 +58,8 @@ def _attach_run_log() -> str:
     "FAILED x: reason" — all land, not just this module's.
 
     FAIL-SOFT BY DESIGN: a run must never fail to fetch evidence because it
-    could not open a log file. Any error here degrades to stderr-only logging,
-    which is exactly the old behavior.
+    could not open a log file. Any error here degrades to stderr-only logging
+    (since 2026-10-12 that is WARNING+ only when stderr is piped by the app).
     """
     run_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
     try:
@@ -100,11 +100,82 @@ def _scrub(argv: Sequence[str]) -> str:
 # ----- entrypoint -----
 
 
+# A piped stderr gets at most this much log text, then one notice. The Mac app
+# reads an agent's pipes only after it exits and a pipe holds 64 KB, so an agent
+# that writes more blocks forever. The cap leaves room for the summary and
+# error prints. The run-log file always has everything.
+_PIPED_STDERR_LOG_BUDGET = 32 * 1024
+# ERROR lines (the "FAILED x" / "run … exit" lines the app shows on a hard
+# failure) still get through past the budget, up to this hard ceiling.
+_PIPED_STDERR_HARD_CEILING = 48 * 1024
+
+
+class _StderrLogHandler(logging.StreamHandler):
+    """Writes to whatever sys.stderr is NOW (not the stream at creation), and
+    stops after a byte budget when stderr is piped."""
+
+    _voxhora_stderr = True
+
+    def __init__(self, budget: int | None) -> None:
+        super().__init__()
+        self._budget = budget
+        self._written = 0
+        self._truncated = False
+
+    @property
+    def stream(self):
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, _value) -> None:
+        pass
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._budget is None:
+            return super().emit(record)
+        # BYTES, not characters: the pipe limit is bytes and "—", "→",
+        # accented names are 2–3 bytes each in UTF-8.
+        size = len(self.format(record).encode("utf-8", "replace")) + 1
+        is_error = record.levelno >= logging.ERROR
+        limit = _PIPED_STDERR_HARD_CEILING if is_error else self._budget
+        if self._written + size > limit:
+            if not self._truncated:
+                self._truncated = True
+                notice = "... further log lines omitted here; the full log is in the agent's run log\n"
+                self._written += len(notice.encode("utf-8"))
+                try:
+                    sys.stderr.write(notice)
+                    sys.stderr.flush()
+                except Exception:  # noqa: BLE001 — logging must never raise
+                    pass
+            return
+        self._written += size
+        super().emit(record)
+
+
+def _configure_stderr_logging() -> None:
+    """INFO to stderr only for a person at a terminal; WARNING+ (capped) when piped.
+
+    2026-10-12 — probe: a child writing 64 KB to an unread pipe exits, 65 KB
+    hangs. The largest real fetch logged 52 KB of INFO, and a run where most
+    items fail (Gomez: 44 of 58) writes ~1 KB of warnings per item. The run log
+    file (_attach_run_log) keeps every line; the app only uses stderr for
+    errors (it filters " INFO: " lines out). The real fix — reading the pipes
+    while the agent runs — is on the Mac side; this keeps old apps safe too.
+    """
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    if any(getattr(h, "_voxhora_stderr", False) for h in root.handlers):
+        return                                  # main() called again (tests)
+    interactive = sys.stderr.isatty()
+    handler = _StderrLogHandler(None if interactive else _PIPED_STDERR_LOG_BUDGET)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s"))
+    handler.setLevel(logging.INFO if interactive else logging.WARNING)
+    root.addHandler(handler)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
-    )
+    _configure_stderr_logging()
     parser = argparse.ArgumentParser(prog="voxhora-techshare-agent")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -147,6 +218,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     fc.add_argument("--case-uuid", default=None, help="Case UUID override (default: from case cache)")
     fc.add_argument("--target-dir", default=None, help="Override download destination (default: ~/Dropbox/Voxhora/Case_Discovery/<cause>/). Used by Voxhora-Mac's Discovery Portal to route into per-client folder layout.")
     fc.add_argument("--manifest", default=None, help="After fetch, write a JSON manifest at this path mapping item id → {path, size_bytes, downloaded_at}. Portal reads this to render the on-disk state.")
+    fc.add_argument("--only", choices=["written"], default=None,
+                    help="written: only documents, photos and small paperwork ZIPs "
+                         "(never audio/video, never anything large); prints "
+                         "NOT-FETCHED-JSON describing what was left for a full fetch.")
 
     # Phase 0.3 (2026-05-25) — Portal-driven per-item fetch + inventory list.
     fi = sub.add_parser("fetch-items", help="Download specific DME items by id (Portal-driven, Phase 0.3).")
@@ -440,6 +515,13 @@ def cmd_status(_args: argparse.Namespace) -> int:
     print(f"State dir:             {config.state_dir()}")
     print(f"Cookies file:          {config.cookies_path()}")
     print(f"Seen DME cache:        {config.seen_dme_path()}")
+    spool = storage.discovery_events_path()
+    try:
+        pending = str(len(spool.read_text().splitlines())) if spool.exists() else "0"
+    except (OSError, UnicodeDecodeError) as e:
+        pending = f"unreadable: {e.__class__.__name__}"
+    writable = os.access(spool if spool.exists() else spool.parent, os.W_OK)
+    print(f"Discovery events:      {spool} ({pending} waiting{'' if writable else ', NOT WRITABLE'})")
     print(f"Case UUID cache:       {config.case_uuid_cache_path()}")
     print(f"  total cases:         {cache_stats['total']}")
     for port, n in sorted(cache_stats["by_port"].items()):
@@ -468,6 +550,9 @@ def cmd_process_email(args: argparse.Namespace) -> int:
 
     event = parse_email_body(body, subject=subject)
     log.info("parsed event: type=%s cause=%s", event.event_type, event.cause_number)
+    if event.event_type in ("dme_discoverable", "attorney_of_record") and event.cause_number:
+        # Before any network call, so a failure below can't lose it.
+        storage.append_discovery_event(event.cause_number, event.event_type)
 
     if event.event_type == "unknown":
         # 2026-08-17 (Rodriguez Vasquez) — an unrecognized email is still a
@@ -731,13 +816,20 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     # streamed in under a second.
     dme_items = sorted(dme_items, key=_size_kb)
 
+    only = getattr(args, "only", None)
     seen = storage.load_seen_dme_ids()
     manifest_entries: dict[str, dict] = {}
     failed_items: list[dict] = []
+    left_for_full_fetch: list[DMEItem] = []
+    attempted_ids: set[str] = set()
     new_downloads = 0
     failures = 0
     for item in dme_items:
         fp = storage.dme_fingerprint(item)
+        if only == "written" and not _is_auto_written(item):
+            left_for_full_fetch.append(item)
+            continue
+        attempted_ids.add(fp)
         if fp in seen:
             # 2026-08-02 (Milestone 5, priority 3) — "seen" alone is not
             # enough. It was written at local-write time, before anything
@@ -837,6 +929,11 @@ def cmd_fetch(args: argparse.Namespace) -> int:
                                  written_path.name, converted.name)
                         written_path = converted
                         size_bytes = converted.stat().st_size
+                # 2026-10-12 — a standalone Outlook email gets the same
+                # readable .txt companion emails inside a ZIP already get
+                # (nothing in the Portal renders .msg). Fail-soft.
+                elif written_path.suffix.lower() == ".msg":
+                    storage.convert_msg_to_text(written_path)
             seen.add(fp)
             new_downloads += 1
             manifest_entries[fp] = _manifest_entry(item, written_path, size_bytes)
@@ -860,10 +957,20 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             # Don't abort the loop — keep trying remaining items
 
     if manifest_path is not None:
-        _write_manifest(manifest_path, cause_number, manifest_entries, failed_items=failed_items)
+        # A written-only run attempts a subset, so (like fetch-items) it must
+        # not replace the full outstanding failure list.
+        _write_manifest(manifest_path, cause_number, manifest_entries,
+                        failed_items=failed_items,
+                        attempted_ids=attempted_ids if only else None)
         log.info("wrote manifest: %s (%d entries)", manifest_path, len(manifest_entries))
 
-    print(f"OK — {cause_number}: {new_downloads} new files downloaded, {failures} failed ({len(dme_items)} total in case)")
+    left_note = f", {len(left_for_full_fetch)} not in this written-only run" if only else ""
+    print(f"OK — {cause_number}: {new_downloads} new files downloaded, {failures} failed ({len(dme_items)} total in case{left_note})")
+    if only == "written":
+        # After the OK line, like FAILED-ITEMS-JSON: additive, one line. Built
+        # from the listing already in memory — no extra TechShare calls.
+        print("NOT-FETCHED-JSON: " + json.dumps(
+            _not_fetched_summary(left_for_full_fetch, seen, cause_number, target_dir), sort_keys=True))
     # 2026-07-04 — machine-readable per-file failure list on stdout, AFTER
     # the OK summary (the Mac app scans lines for the "OK — " prefix; this
     # line is additive and invisible to older parsers). One line, one JSON
@@ -1046,6 +1153,11 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
                                  written_path.name, converted.name)
                         written_path = converted
                         size_bytes = converted.stat().st_size
+                # 2026-10-12 — a standalone Outlook email gets the same
+                # readable .txt companion emails inside a ZIP already get
+                # (nothing in the Portal renders .msg). Fail-soft.
+                elif written_path.suffix.lower() == ".msg":
+                    storage.convert_msg_to_text(written_path)
             seen.add(fp)
             new_downloads += 1
             manifest_entries[fp] = _manifest_entry(item, written_path, size_bytes)
@@ -1169,6 +1281,85 @@ def _size_kb(item: DMEItem) -> int:
     return int(digits) if digits else (1 << 60)
 
 
+# ----- written-only fetch (2026-10-12, Patrick: written discovery downloads
+# itself; audio/video stays a manual button) -----
+#
+# Decided by file type AND size, never by TechShare's label alone: a ZIP
+# labelled "Supplemental Case Info" reached 18.9 GB. Patrick's rulings: photos
+# and small paperwork ZIPs come down automatically too. Its own function on
+# purpose — _classify_item feeds the Portal's list/manifest categories.
+_AUTO_DOC_EXTS = (".pdf", ".doc", ".docx", ".rtf", ".txt", ".msg", ".htm", ".html",
+                  ".xls", ".xlsx", ".csv")
+_AUTO_PHOTO_EXTS = (".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff",
+                    ".gif", ".bmp", ".webp")
+_AUTO_MAX_BYTES = 100_000_000          # largest real written item: 29.5 MB
+_AUTO_MAX_ZIP_BYTES = 50_000_000       # paperwork ZIPs: median 851 KB / 11 KB
+
+_VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".wmv", ".mpg",
+               ".mpeg", ".asf", ".3gp", ".av3", ".av")
+_AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".wma", ".amr", ".opus")
+_ARCHIVE_EXTS = (".zip", ".7z", ".rar", ".tar", ".gz")
+
+
+def _is_auto_written(item: DMEItem) -> bool:
+    """True when a written-only fetch may download this item.
+
+    Order: TechShare's Video/Audio label vetoes (a .msg labelled "Audio - 911
+    Call" stays out); then the file type must be a document, a photo or a ZIP;
+    then the size must be known and under the cap. Unknown size = not written.
+    """
+    if item.is_video or item.is_audio:
+        return False
+    window = storage.expected_size_range(item)
+    if window is None:
+        return False
+    name = item.name.lower()
+    if name.endswith(".zip"):
+        # Patrick: photos automatic — a photo bundle gets the general cap
+        # (real ones run 53–95 MB); any other ZIP the paperwork cap.
+        is_photos = item.type.strip().lower() == "photographs"
+        return window[1] <= (_AUTO_MAX_BYTES if is_photos else _AUTO_MAX_ZIP_BYTES)
+    if name.endswith(_AUTO_DOC_EXTS + _AUTO_PHOTO_EXTS):
+        return window[1] <= _AUTO_MAX_BYTES
+    return False
+
+
+def _not_fetched_kind(item: DMEItem) -> str:
+    name = item.name.lower()
+    if item.is_video or name.endswith(_VIDEO_EXTS):
+        return "video"
+    if item.is_audio or name.endswith(_AUDIO_EXTS):
+        return "audio"
+    if name.endswith(_ARCHIVE_EXTS):
+        return "bundle"
+    return "other"
+
+
+def _not_fetched_summary(items: list[DMEItem], seen: set[str], cause_number: str,
+                         target_dir: Path | None = None) -> dict:
+    """What a written-only run left for the audio/video button, by kind:
+    {"video": {"count": n, "bytes": b}, ...}. Items already downloaded (seen
+    AND in the Portal) are not "waiting", so they are left out. Bytes use
+    TechShare's listed size (0 when it lists none)."""
+    out: dict[str, dict] = {}
+    for item in items:
+        if not (item.name or "").strip():
+            continue        # nameless listing rows can never be fetched (3 in 2,430)
+        if storage.dme_fingerprint(item) in seen and storage.is_present_in_portal(item, cause_number):
+            continue
+        # Only look for a staged copy where one could exist: computing the
+        # target path creates the case folder, and a summary must not.
+        if target_dir is not None and target_dir.is_dir():
+            staged = storage.case_discovery_target_path(item, cause_number, target_dir=target_dir)
+            if storage.staged_copy_is_complete(item, staged):
+                continue    # already down, waiting for its Dropbox upload
+        kind = out.setdefault(_not_fetched_kind(item), {"count": 0, "bytes": 0})
+        window = storage.expected_size_range(item)
+        kind["count"] += 1
+        kind["bytes"] += window[0] if window else 0
+    return out
+
+
 def _classify_item(item: DMEItem) -> str:
     """Map a DMEItem to Portal-level category (video|written|audio|other)
     used by the Discovery Portal's filter chips + "Add all of type X"
@@ -1234,6 +1425,7 @@ def _write_manifest(
     cause_number: str,
     entries: dict[str, dict],
     failed_items: list[dict] | None = None,
+    attempted_ids: set[str] | None = None,
 ) -> None:
     """Atomically write the post-fetch manifest at `path`. If a manifest
     already exists at that path, MERGE — preserve prior items so multiple
@@ -1243,7 +1435,9 @@ def _write_manifest(
     not-yet-seen item, so its failure list is the COMPLETE outstanding set
     for the cause — it REPLACES the prior list (an item that succeeded this
     run must drop off). Callers that only attempt a subset (fetch-items)
-    pass None, which PRESERVES the prior list untouched.
+    pass None, which PRESERVES the prior list untouched. A written-only
+    `fetch` (2026-10-12) passes `attempted_ids`: prior failures for items it
+    attempted are replaced by this run's outcome, the rest are kept.
     """
     existing: dict[str, dict] = {}
     prior_failed: list[dict] = []
@@ -1259,7 +1453,12 @@ def _write_manifest(
         "cause_number": cause_number,
         "written_at_utc": datetime.now(timezone.utc).isoformat(),
         "items": merged,
-        "failed_items": prior_failed if failed_items is None else failed_items,
+        "failed_items": (
+            prior_failed if failed_items is None
+            else [f for f in prior_failed if f.get("id") not in attempted_ids] + failed_items
+            if attempted_ids is not None
+            else failed_items
+        ),
     }
     storage.atomic_write_json(path, payload)
 

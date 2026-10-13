@@ -90,6 +90,62 @@ def save_seen_dme_ids(ids: set[str], username: str | None = None) -> set[str]:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
 
 
+# ----- discovery events for the Mac app (2026-10-12) -----
+#
+# A TechShare "DME made discoverable" or "Attorney of record" email tells the
+# Mac app to download that case's written discovery. The event is appended to
+# this spool by process-email right after parsing — before any network call —
+# so it survives a PC failure (exit 1), a killed Mail scan and the manual
+# "Scan Inbox Now" path, none of which reliably hand the agent's output back.
+# One JSON object per line, cause number + kind + time only: never a name.
+#
+# DRAINER CONTRACT (the Mac app): take flock(2) on `discovery_events.lock`
+# (exactly that name — not the .jsonl, not NSFileCoordinator), THEN open and
+# read `discovery_events.jsonl`, then remove or truncate it BY PATH, then
+# unlock. Never keep a file handle across drains: every append replaces the
+# file (atomic rename), so an old handle points at a dead copy. Drain only
+# after the Mail scan's process-email runs have exited (the event is written
+# before the email's own PC download finishes), merge events per cause, and
+# ignore events older than 48 h (an app build without a drainer may have let
+# them pile up — the catch-up pass covers those cases instead).
+_SPOOL_MAX_LINES = 2000      # an app that never drains (old build) can't grow it forever
+
+
+def discovery_events_path(username: str | None = None) -> Path:
+    return config.state_dir(username) / "discovery_events.jsonl"
+
+
+def append_discovery_event(cause_number: str, kind: str, username: str | None = None) -> None:
+    """Append {cause, kind, ts}. Never raises — an email must not fail
+    (and re-run every Mail tick) because the spool could not be written."""
+    try:
+        path = discovery_events_path(username)
+        line = json.dumps({
+            "cause": cause_number,
+            "kind": kind,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }, sort_keys=True)
+        with open(path.with_suffix(".lock"), "w") as lock_fh:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX)
+            try:
+                lines = path.read_text().splitlines() if path.exists() else []
+                # An email that keeps failing is re-run every Mail tick; one
+                # undrained event per (cause, kind) is enough.
+                for existing in lines:
+                    try:
+                        e = json.loads(existing)
+                    except ValueError:
+                        continue
+                    if e.get("cause") == cause_number and e.get("kind") == kind:
+                        return
+                lines.append(line)
+                atomic_write_text(path, "\n".join(lines[-_SPOOL_MAX_LINES:]) + "\n")
+            finally:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+    except Exception as e:  # noqa: BLE001 — see docstring
+        log.warning("could not record discovery event for %s: %s", cause_number, e)
+
+
 def dme_fingerprint(item: DMEItem) -> str:
     """Stable identity for dedup. Prefers the dmeId query param if present."""
     href = item.enclosure_href or ""

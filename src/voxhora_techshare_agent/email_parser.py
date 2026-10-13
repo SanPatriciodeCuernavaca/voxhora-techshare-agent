@@ -43,6 +43,8 @@ from .models import TechShareEvent
 # Others (J1JV juvenile, etc.) not observed but the regex tolerates them.
 _CAUSE_RE = re.compile(r"\b([CD]\d[A-Z]{2,3}\d{6,12})\b")
 
+_CASE_NUMBER_LINE_RE = re.compile(r"Case\s+Number\s*:\s*([CD]\d[A-Z]{2,3}\d{6,12})\b", re.IGNORECASE)
+
 # "DME was made discoverable" trigger phrase
 _DME_TRIGGER_RE = re.compile(r"DME\s+(was|were)\s+made\s+discoverable", re.IGNORECASE)
 
@@ -77,8 +79,12 @@ def parse_email_body(body: str, subject: str | None = None) -> TechShareEvent:
     Caller decides how to handle unknown events (typically: log, green-flag,
     move on).
     """
-    cause_match = _CAUSE_RE.search(body)
-    cause_number = cause_match.group(1) if cause_match else ""
+    # 2026-10-12 — the body lists "Incident Number:" BEFORE "Case Number:";
+    # when they differ the case is the one to fetch. First cause-shaped token
+    # stays the fallback for bodies without the label.
+    case_line = _CASE_NUMBER_LINE_RE.search(body)
+    cause_match = case_line or _CAUSE_RE.search(body)
+    cause_number = cause_match.group(1).upper() if cause_match else ""
 
     excerpt = body.strip().replace("\r", "").replace("\n", " | ")[:200]
 
