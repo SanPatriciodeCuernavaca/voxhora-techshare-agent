@@ -572,7 +572,7 @@ def cmd_process_email(args: argparse.Namespace) -> int:
                 seen.add(fp)
                 pcs_downloaded += 1
         finally:
-            storage.save_seen_dme_ids(seen)
+            seen |= storage.save_seen_dme_ids(seen)
         if pc_failures:
             storage.record_run_result(
                 mode="process-email",
@@ -842,7 +842,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             manifest_entries[fp] = _manifest_entry(item, written_path, size_bytes)
             # Persist seen-set after EACH success so a mid-fetch crash
             # doesn't re-download work already complete.
-            storage.save_seen_dme_ids(seen)
+            seen |= storage.save_seen_dme_ids(seen)
         except Exception as e:
             log.error("FAILED %s: %s", item.name, e)
             failures += 1
@@ -856,7 +856,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
                 "reason": str(e)[:300],
             })
             # Persist seen-set even on partial failure
-            storage.save_seen_dme_ids(seen)
+            seen |= storage.save_seen_dme_ids(seen)
             # Don't abort the loop — keep trying remaining items
 
     if manifest_path is not None:
@@ -1049,7 +1049,7 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
             seen.add(fp)
             new_downloads += 1
             manifest_entries[fp] = _manifest_entry(item, written_path, size_bytes)
-            storage.save_seen_dme_ids(seen)
+            seen |= storage.save_seen_dme_ids(seen)
         except Exception as e:
             log.error("FAILED %s: %s", item.name, e)
             failures += 1
@@ -1061,7 +1061,7 @@ def cmd_fetch_items(args: argparse.Namespace) -> int:
                 "id": fp,
                 "reason": str(e)[:300],
             })
-            storage.save_seen_dme_ids(seen)
+            seen |= storage.save_seen_dme_ids(seen)
 
     if manifest_path is not None:
         # NOTE: failed_items is deliberately NOT passed here. _write_manifest
@@ -1336,7 +1336,7 @@ def _refresh_one_case(
         except Exception as e:
             result["error"] = result["error"] or f"PC write failed: {e}"
             continue
-    storage.save_seen_dme_ids(seen)
+    seen |= storage.save_seen_dme_ids(seen)
 
     # Plea offer (only if the link is present on the case)
     try:

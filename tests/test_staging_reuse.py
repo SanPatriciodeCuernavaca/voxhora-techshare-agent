@@ -184,7 +184,7 @@ def test_cmd_fetch_skips_the_network_when_the_bytes_are_already_staged(tmp_path,
     monkeypatch.setattr(cli, "TechShareSession", lambda: _SessionOK())
     monkeypatch.setattr(cli, "TechShareClient", lambda s: client)
     monkeypatch.setattr(_storage, "load_seen_dme_ids", lambda *a, **k: set())
-    monkeypatch.setattr(_storage, "save_seen_dme_ids", lambda *a, **k: None)
+    monkeypatch.setattr(_storage, "save_seen_dme_ids", lambda *a, **k: set())
     monkeypatch.setattr(
         _storage, "case_discovery_target_path",
         lambda item, cause, target_dir=None: tmp_path / item.name,

@@ -64,9 +64,30 @@ def load_seen_dme_ids(username: str | None = None) -> set[str]:
         return set()
 
 
-def save_seen_dme_ids(ids: set[str], username: str | None = None) -> None:
+def save_seen_dme_ids(ids: set[str], username: str | None = None) -> set[str]:
+    """Add `ids` to the seen file — never removes, under a cross-process lock.
+
+    2026-10-12 — one seen file serves every agent process at once: a
+    multi-hour video fetch, a written-discovery fetch, process-email and the
+    PC backfill. Each loads the set once at start and used to rewrite the
+    WHOLE file from that stale copy after every item, so a long run erased
+    every fingerprint another process had added meanwhile, and those PCs and
+    files were fetched again. Same bug class and same fix as
+    upsert_case_cache_entry: the flock makes read-merge-write one step. Nothing
+    ever removes a fingerprint, so a union loses nothing. Returns the merged
+    set so a long run also learns what siblings added (`seen |= save(seen)`)
+    instead of downloading it a second time.
+    """
     path = config.seen_dme_path(username)
-    atomic_write_json(path, sorted(ids))
+    lock_path = path.with_suffix(".lock")
+    with open(lock_path, "w") as lock_fh:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        try:
+            merged = load_seen_dme_ids(username) | ids
+            atomic_write_json(path, sorted(merged))
+            return merged
+        finally:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
 
 
 def dme_fingerprint(item: DMEItem) -> str:

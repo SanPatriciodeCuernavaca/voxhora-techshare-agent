@@ -138,6 +138,10 @@ class TechShareSession:
         self.username = username or self._default_username()
         self._session = requests.Session()
         self._csrf_token: str | None = None
+        # 2026-10-12 — reauthenticate() snapshots this before any prep has
+        # ever set it; unset, the first mid-run re-login raised AttributeError
+        # and every retry ran on the dead session.
+        self._dpa_cache: str | None = None
         self._credentials_override = credentials_override
         if cookie_storage not in ("disk", "memory"):
             raise ValueError(f"cookie_storage must be 'disk' or 'memory', got {cookie_storage!r}")

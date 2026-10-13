@@ -298,6 +298,20 @@ def test_failed_relogin_propagates_the_real_error(monkeypatch):
         s.reauthenticate()
 
 
+def test_relogin_on_a_fresh_session_works(monkeypatch):
+    """2026-10-12 — a session built by __init__ (not hand-assembled like the
+    fixture above) has never run a prep, so nothing had set _dpa_cache. The
+    first mid-run re-login raised AttributeError before logging in, the caller
+    swallowed it as a warning, and every retry ran on the dead session."""
+    s = TechShareSession(
+        "tester", credentials_override=("tester", "pw"), cookie_storage="memory"
+    )
+    logged_in = []
+    s.login = lambda: logged_in.append(True)
+    s.reauthenticate()
+    assert logged_in == [True], "the re-login must actually happen"
+
+
 def test_successful_relogin_still_replaces_state(monkeypatch):
     """The normal path is unchanged — a good re-login still swaps in fresh auth."""
     s = _session_with_state(monkeypatch, login_raises=False)
@@ -431,7 +445,7 @@ def _wire_fetch_items(monkeypatch, tmp_path, items, fail_on=None):
     monkeypatch.setattr(cli, "TechShareSession", lambda: _FakeSessionOK())
     monkeypatch.setattr(cli, "TechShareClient", lambda s: _FakeItemsClient(items, fail_on))
     monkeypatch.setattr(_storage, "load_seen_dme_ids", lambda *a, **k: set())
-    monkeypatch.setattr(_storage, "save_seen_dme_ids", lambda *a, **k: None)
+    monkeypatch.setattr(_storage, "save_seen_dme_ids", lambda *a, **k: set())
     monkeypatch.setattr(
         _storage, "case_discovery_target_path",
         lambda item, cause, target_dir=None: tmp_path / item.name,
