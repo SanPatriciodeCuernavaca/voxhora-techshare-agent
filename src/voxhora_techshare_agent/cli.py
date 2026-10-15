@@ -35,6 +35,7 @@ from . import config, storage
 from .email_parser import parse_email_body
 from .models import CaseDetail, DMEItem
 from .proxy_client import TechShareClient
+from . import session as session_module
 from .session import TechShareAuthError, TechShareSession
 
 log = logging.getLogger(__name__)
@@ -352,6 +353,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Every exit path records its code. A run that ends without a matching
     # "run ... exit" line was killed, and that is itself the finding — the
     # old behavior left no way to tell a killed run from a clean one.
+    session_module.reset_relogin_refusal()
     try:
         rc = _run_guarded(run_id, lambda: dispatch[args.command](args))
         log.info("run %s exit %s", run_id, rc)
@@ -370,6 +372,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.error("run %s exit 1: %s", run_id, e)
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
+    finally:
+        # A print, not a log line: it must reach the Mac app whatever the
+        # piped stderr budget did. Its wording ("failed: " + TechShare's own
+        # answer) is what the app's password warning reads.
+        refusal = session_module.relogin_refusal()
+        if refusal is not None:
+            try:
+                print(f"PASSWORD REFUSED: mid-run re-login failed: {refusal}", file=sys.stderr)
+            except Exception:  # noqa: BLE001 — reporting must never raise
+                pass
 
 
 # ----- subcommands -----

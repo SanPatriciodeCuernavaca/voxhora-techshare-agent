@@ -13,10 +13,13 @@ cookies requests.Session collects after a successful login.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import hmac
 import logging
 import os
 import pickle
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +55,76 @@ log = logging.getLogger(__name__)
 # tolerating misses is the point. Erring short costs one cheap GET every two
 # minutes; erring long costs a multi-GB download hours in.
 SESSION_KEEPALIVE_SECONDS: float = 120.0  # 2 min; only 4.0 min was proven alive
+
+
+# ----- a password refusal ends this run's sign-ins (2026-10-15) -----
+#
+# A mid-run re-login (reauthenticate) runs before every download retry. When
+# TechShare turns it down because the saved PASSWORD is wrong, expired or
+# locked out, every further re-login in the run would be one more refused
+# sign-in — up to two per failing file, and TechShare locks the account after
+# about five (08-10). So the first such refusal ends re-logins for the rest of
+# the run (one process = one run): the run goes on with the session it has,
+# finishes and prints its summary as usual (so what it already downloaded is
+# uploaded), and main() prints the refusal so the Mac app turns its password
+# warning on and holds every automatic sign-in. The hold covers only the
+# password TechShare turned down: once the attorney saves a new one (Connect &
+# Verify during a long run) the next retry signs in with it, and a lockout
+# ("max number failed login attempts", 10 minutes) is waited out for 15 —
+# the Mac app's own lockout window. Only TechShare's own words
+# count, read from the agent's own wording on (the same rule as the Mac app's
+# TechSharePasswordWarning): anything else — a collision 400 ("User not
+# found"), 5xx, a timeout — keeps today's re-login on every retry.
+_REJECTED_ANCHOR = "login rejected by server"
+_PASSWORD_PHRASES = (
+    "max number failed login attempts",
+    "password is expired",
+    "password does not match",
+)
+_EXPIRED_MESSAGE = "techshare password is expired"
+
+_LOCKOUT_PHRASE = "max number failed login attempts"
+_LOCKOUT_WAIT_SECONDS = 15 * 60
+
+# The refused password is never kept, only a keyed hash of it in memory
+# (the key is new in every process), to tell a NEW saved password apart.
+_FINGERPRINT_KEY = os.urandom(32)
+
+_relogin_refusal: str | None = None
+_relogin_refused_fingerprint: bytes | None = None
+_relogin_refused_at: float = 0.0
+
+
+def _password_fingerprint(password: str) -> bytes:
+    return hmac.new(_FINGERPRINT_KEY, password.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+def is_password_refusal(err: BaseException | str) -> bool:
+    """True only for TechShare's own password answers (see above)."""
+    text = str(err).lower()
+    at = text.find(_REJECTED_ANCHOR)
+    if at >= 0:
+        tail = text[at:]
+        return any(phrase in tail for phrase in _PASSWORD_PHRASES)
+    return text.startswith(_EXPIRED_MESSAGE)
+
+
+def relogin_refusal() -> str | None:
+    """The password refusal that ended this run's re-logins, if any."""
+    return _relogin_refusal
+
+
+def reset_relogin_refusal() -> None:
+    """Start of a run (tests call main() in-process, so a run starts clean),
+    or a saved password other than the refused one."""
+    global _relogin_refusal, _relogin_refused_fingerprint, _relogin_refused_at
+    _relogin_refusal = None
+    _relogin_refused_fingerprint = None
+    _relogin_refused_at = 0.0
 
 
 class TechShareAuthError(RuntimeError):
@@ -702,6 +775,25 @@ class TechShareSession:
         log.info("session not authenticated; attempting login")
         self.login()
 
+    def _saved_password_or_none(self) -> str | None:
+        try:
+            return self._retrieve_credentials()[1]
+        except Exception:  # noqa: BLE001 — login() reports a missing login itself
+            return None
+
+    def _refused_password_still_saved(self) -> bool:
+        """True while a re-login would send TechShare the password it refused:
+        the same saved password, and (for a lockout) inside the wait."""
+        if _relogin_refusal is not None and _LOCKOUT_PHRASE in _relogin_refusal.lower():
+            if _monotonic() - _relogin_refused_at >= _LOCKOUT_WAIT_SECONDS:
+                return False
+        if _relogin_refused_fingerprint is None:
+            return True  # nothing to compare: keep holding
+        password = self._saved_password_or_none()
+        if password is None:
+            return True
+        return hmac.compare_digest(_password_fingerprint(password), _relogin_refused_fingerprint)
+
     def reauthenticate(self) -> None:
         """Force a FRESH login mid-run (2026-07-04 root-cause fix).
 
@@ -730,6 +822,16 @@ class TechShareSession:
         failed re-login leaves the session exactly as it was — no better, but
         no worse — and the ORIGINAL error propagates instead of a CSRF echo.
         """
+        global _relogin_refusal, _relogin_refused_fingerprint, _relogin_refused_at
+        if _relogin_refusal is not None:
+            if self._refused_password_still_saved():
+                # TechShare already turned this password down in this run:
+                # another try would be one more refused sign-in on the account.
+                raise TechShareAuthError(
+                    "re-login skipped: TechShare refused the saved password earlier in this run"
+                )
+            log.info("a new TechShare password is saved (or the lockout is over): re-login allowed again")
+            reset_relogin_refusal()
         log.info("re-authenticating mid-run (session presumed expired)")
         saved_token = self._csrf_token
         saved_dpa = self._dpa_cache
@@ -744,8 +846,19 @@ class TechShareSession:
             except KeyError:
                 pass
         try:
+            password = self._saved_password_or_none()
             self.login()
-        except Exception:
+        except Exception as e:
+            if is_password_refusal(e):
+                # One line: the Mac app reads TechShare's answer line by line.
+                _relogin_refusal = " ".join(str(e).split())
+                _relogin_refused_fingerprint = (
+                    _password_fingerprint(password) if password is not None else None
+                )
+                _relogin_refused_at = _monotonic()
+                # ERROR, not WARNING: it must reach the app past the piped
+                # stderr budget (main() also prints it at the end of the run).
+                log.error("mid-run re-login failed: %s — no more sign-ins this run", _relogin_refusal)
             # Put back exactly what we took away, then let the caller see the
             # real reason the re-login failed.
             self._csrf_token = saved_token
