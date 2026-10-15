@@ -1312,6 +1312,25 @@ def lookup_case(cause_number: str, username: str | None = None) -> dict | None:
     return cache.get(canonical_cause(cause_number)) or cache.get(cause_number)
 
 
+def recent_good_causes(username: str | None = None) -> list[str]:
+    """Causes whose last recorded run had no error, newest first (refresh,
+    backfill-all and process-email record runs; fetch does not). Used to pick
+    the control cases for the "is this case still in your TechShare?" check."""
+    path = config.last_run_path(username)
+    try:
+        history = json.loads(path.read_text()).get("history", []) if path.exists() else []
+    except Exception:
+        return []
+    out: list[str] = []
+    for row in reversed(history):
+        cause = row.get("cause_number")
+        if cause and not row.get("error"):
+            key = canonical_cause(cause)
+            if key not in out:
+                out.append(key)
+    return out
+
+
 def case_cache_stats(username: str | None = None) -> dict:
     """Counts by backend port (useful for cli status output)."""
     cache = load_case_cache(username)

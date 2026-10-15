@@ -31,6 +31,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+import requests
+
 from . import config, storage
 from .email_parser import parse_email_body
 from .models import CaseDetail, DMEItem
@@ -498,6 +500,149 @@ def cmd_add_cause(args: argparse.Namespace) -> int:
     return 0
 
 
+def _backend_for(cause: str) -> tuple[str, str, int] | None:
+    """(service id, backend path, port) for a cause's TechShare backend, or
+    None for an unknown prefix (C1CR = County Attorney, D1DC = District
+    Attorney)."""
+    if cause.startswith("C1CR"):
+        return config.SERVICE_TRAVIS_COUNTY_ATTORNEY, config.BACKEND_CA, 1030
+    if cause.startswith("D1DC"):
+        return config.SERVICE_TRAVIS_DISTRICT_ATTORNEY, config.BACKEND_DA, 1031
+    return None
+
+
+# ----- "this case isn't in your TechShare" (2026-10-15) -----
+#
+# For a case that has left the attorney's TechShare (taken off it, closed),
+# TechShare answers its case-detail call with a 500 — which reads exactly like
+# TechShare being down — and its cause-number lookup with a 404 (live probe on
+# a stale case, 10-15). So before calling a case gone, the agent:
+#   1. signs in again and retries (a stale session can 500 too). A PASSWORD
+#      refusal there stays a password refusal; any other sign-in trouble is
+#      the original error (exit 1) — an outage never becomes "AUTH ERROR";
+#   2. asks the cause-number lookup, never the cache: a listed case is a
+#      TechShare hiccup (exit 1), a new case id is cached and retried;
+#   3. "no such case" (a 404 — nothing else) counts only when TechShare
+#      answers for this account's OTHER cases on the same backend in the same
+#      run (up to 3 controls) — the approved rule "other cases worked with the
+#      same sign-in, so TechShare itself was up" — AND, asked again right
+#      after a control answered, still has no such case (Gate 2: a backend
+#      coming back between the two questions must never grey a live case).
+#      Otherwise exit 1, as today.
+# Then: exit 5 + one CASE NOT IN YOUR TECHSHARE line. The Mac app counts it
+# only twice at least an hour apart. A 404 for a case that was never cached
+# (PC not posted yet) never gets here.
+CASE_GONE_EXIT = 5
+_CONTROL_LOOKUPS = 3
+
+
+class CaseNotInTechShare(Exception):
+    """TechShare has no case for this cause for this account (see above)."""
+
+
+def _lookup_cause(cause: str, session) -> tuple[str, str | None]:
+    """TechShare's own answer for a cause — the cause-number lookup, never the
+    cache: ("found", case id) · ("none", None) for a 404 only (the stale-case
+    answer seen live 10-15) · ("error", None) for anything else, an empty
+    answer included (Gate 2: a degraded backend may answer empty)."""
+    route = _backend_for(cause)
+    if route is None:
+        return "error", None
+    service_id, backend, _ = route
+    try:
+        payload = session.api_post_json("/api/proxy", {
+            "externalServiceId": service_id,
+            "Method": "GET",
+            "Path": f"{backend}/CaseByCaseNumber?caseNumber={cause}",
+        })
+    except requests.HTTPError as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        return ("none", None) if status == 404 else ("error", None)
+    except Exception:  # noqa: BLE001 — timeouts, not-JSON: no answer
+        return "error", None
+    items = (payload or {}).get("collection", {}).get("items", []) if isinstance(payload, dict) else []
+    if not items:
+        return "error", None
+    for d in items[0].get("data", []):
+        if d.get("name") == "case-id" and d.get("value"):
+            return "found", d["value"]
+    return "error", None
+
+
+def _control_causes(cause: str, case_uuid: str | None, limit: int = _CONTROL_LOOKUPS) -> list[str]:
+    """Other cached causes on the same backend to ask about, newest working
+    first (run history), then the cache newest-added first. Never this cause
+    (any spelling) or anything cached under the same case id."""
+    key = storage.canonical_cause(cause)
+    prefix = key[:4]
+    # Keyed the canonical way, whatever spelling the cache used (Gate 2: a
+    # dashed key was never found).
+    cache = {storage.canonical_cause(k): v for k, v in storage.load_case_cache().items()}
+    out: list[str] = []
+    for candidate in storage.recent_good_causes() + list(reversed(list(cache))):
+        if len(out) >= limit:
+            break
+        if candidate == key or not candidate.startswith(prefix) or candidate in out:
+            continue
+        entry = cache.get(candidate)
+        if entry is None or (case_uuid and entry.get("case_uuid") == case_uuid):
+            continue
+        out.append(candidate)
+    return out
+
+
+def _is_http_500(err: BaseException) -> bool:
+    return isinstance(err, requests.HTTPError) and \
+        getattr(getattr(err, "response", None), "status_code", None) == 500
+
+
+def _recover_case_detail(cause: str, session, client, service_id: str, case_uuid: str,
+                         first_error: BaseException) -> CaseDetail:
+    """After the case-detail call answered 500: the case detail if a fresh
+    sign-in or a moved case id heals it; CaseNotInTechShare when TechShare
+    says it has no such case while answering for other cases; otherwise the
+    original error (see the block comment above)."""
+    try:
+        session.reauthenticate()
+    except TechShareAuthError as e:
+        if session_module.is_password_refusal(e):
+            raise
+        raise first_error
+    except Exception:  # noqa: BLE001 — any other sign-in trouble: today's error
+        raise first_error
+    try:
+        return client.get_case_detail(service_id, case_uuid)
+    except Exception as e:  # noqa: BLE001
+        if not _is_http_500(e):
+            raise
+        first_error = e
+
+    answer, found_uuid = _lookup_cause(cause, session)
+    if answer == "found":
+        if found_uuid and found_uuid != case_uuid:
+            route = _backend_for(cause)
+            storage.upsert_case_cache_entry(storage.canonical_cause(cause), {
+                "case_uuid": found_uuid, "service_id": service_id, "backend_port": route[2] if route else None,
+            })
+            log.info("case id for %s changed on TechShare; cache updated", cause)
+            return client.get_case_detail(service_id, found_uuid)
+        raise first_error  # listed on TechShare: a hiccup
+    if answer == "error":
+        raise first_error
+    for control in _control_causes(cause, case_uuid):
+        if _lookup_cause(control, session)[0] == "found":
+            # TechShare is answering right now: ask about the case once more.
+            if _lookup_cause(cause, session)[0] == "none":
+                raise CaseNotInTechShare(cause)
+            raise first_error
+    log.warning("no-case answer for %s, but no other case answered either: treated as TechShare trouble", cause)
+    raise first_error
+
+
+def _case_gone_line(cause: str) -> str:
+    return f"CASE NOT IN YOUR TECHSHARE: TechShare has no case {cause} for this account"
+
+
 def _resolve_and_cache_cause(cause: str, session) -> dict | None:
     """Resolve a cause's TechShare case UUID via /CaseByCaseNumber and write it
     to case_uuid_cache.json, reusing an already-authenticated session. Returns
@@ -519,16 +664,10 @@ def _resolve_and_cache_cause(cause: str, session) -> dict | None:
     if existing:
         return existing
 
-    if cause.startswith("C1CR"):
-        service_id = config.SERVICE_TRAVIS_COUNTY_ATTORNEY
-        backend = config.BACKEND_CA
-        backend_port = 1030
-    elif cause.startswith("D1DC"):
-        service_id = config.SERVICE_TRAVIS_DISTRICT_ATTORNEY
-        backend = config.BACKEND_DA
-        backend_port = 1031
-    else:
+    route = _backend_for(cause)
+    if route is None:
         return None
+    service_id, backend, backend_port = route
 
     backend_path = f"{backend}/CaseByCaseNumber?caseNumber={cause}"
     try:
@@ -884,7 +1023,17 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
     client = TechShareClient(session)
 
-    case = client.get_case_detail(service_id, case_uuid)
+    try:
+        case = client.get_case_detail(service_id, case_uuid)
+    except Exception as e:  # noqa: BLE001
+        if not _is_http_500(e):
+            raise
+        try:
+            case = _recover_case_detail(cause_number, session, client, service_id, case_uuid, e)
+        except CaseNotInTechShare:
+            log.warning("fetch %s: TechShare has no such case for this account", cause_number)
+            print(_case_gone_line(cause_number), file=sys.stderr)
+            return CASE_GONE_EXIT
     dme_items = client.get_dme_list(service_id, case)
     log.info("fetch %s: %d DME items total", cause_number, len(dme_items))
 
@@ -1571,9 +1720,26 @@ def _refresh_one_case(
 
     try:
         case = client.get_case_detail(service_id, case_uuid)
-    except Exception as e:
-        result["error"] = f"case-detail failed: {e}"
-        return result
+    except Exception as e:  # noqa: BLE001
+        if not _is_http_500(e):
+            result["error"] = f"case-detail failed: {e}"
+            return result
+        # A password refusal on the fresh sign-in propagates (exit 2): it is
+        # outside this function's fail-soft handling on purpose.
+        try:
+            case = _recover_case_detail(cause_number, client.session, client, service_id, case_uuid, e)
+        except CaseNotInTechShare:
+            result["error"] = "case not in your TechShare"
+            result["gone"] = True
+            return result
+        except TechShareAuthError as auth_err:
+            if session_module.is_password_refusal(auth_err):
+                raise
+            result["error"] = f"case-detail failed: {auth_err}"
+            return result
+        except Exception as e2:  # noqa: BLE001
+            result["error"] = f"case-detail failed: {e2}"
+            return result
 
     # PC affidavit only
     try:
@@ -1642,6 +1808,9 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         plea_captured=r["plea_captured"],
         error=r["error"],
     )
+    if r.get("gone"):
+        print(_case_gone_line(args.cause_number), file=sys.stderr)
+        return CASE_GONE_EXIT
     if r["error"]:
         print(f"ERROR {args.cause_number}: {r['error']}", file=sys.stderr)
         return 1
@@ -1682,7 +1851,10 @@ def cmd_backfill_all(args: argparse.Namespace) -> int:
             totals["pleas"] += 1
         if r["error"]:
             totals["errors"] += 1
-            print(f"  [{i}/{len(causes)}] {cause}: ERROR {r['error']}", file=sys.stderr)
+            if r.get("gone"):
+                print(f"  [{i}/{len(causes)}] {_case_gone_line(cause)}", file=sys.stderr)
+            else:
+                print(f"  [{i}/{len(causes)}] {cause}: ERROR {r['error']}", file=sys.stderr)
         else:
             print(f"  [{i}/{len(causes)}] {cause}: PCs +{r['pcs_downloaded']}, plea {'Y' if r['plea_captured'] else '-'}")
         storage.record_run_result(
