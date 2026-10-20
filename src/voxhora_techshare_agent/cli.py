@@ -531,7 +531,7 @@ def _backend_for(cause: str) -> tuple[str, str, int] | None:
 #      Otherwise exit 1, as today.
 # Then: exit 5 + one CASE NOT IN YOUR TECHSHARE line. The Mac app counts it
 # only twice at least an hour apart. A 404 for a case that was never cached
-# (PC not posted yet) never gets here.
+# never gets here: that is exit 4, with at most the NOT_LISTED_MARKER below.
 CASE_GONE_EXIT = 5
 _CONTROL_LOOKUPS = 3
 
@@ -543,8 +543,9 @@ class CaseNotInTechShare(Exception):
 def _lookup_cause(cause: str, session) -> tuple[str, str | None]:
     """TechShare's own answer for a cause — the cause-number lookup, never the
     cache: ("found", case id) · ("none", None) for a 404 only (the stale-case
-    answer seen live 10-15) · ("error", None) for anything else, an empty
-    answer included (Gate 2: a degraded backend may answer empty)."""
+    answer seen live 10-15) · ("timeout", None) when TechShare took too long ·
+    ("error", None) for anything else, an empty answer included (Gate 2: a
+    degraded backend may answer empty)."""
     route = _backend_for(cause)
     if route is None:
         return "error", None
@@ -558,7 +559,9 @@ def _lookup_cause(cause: str, session) -> tuple[str, str | None]:
     except requests.HTTPError as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
         return ("none", None) if status == 404 else ("error", None)
-    except Exception:  # noqa: BLE001 — timeouts, not-JSON: no answer
+    except requests.Timeout:
+        return "timeout", None
+    except Exception:  # noqa: BLE001 — not-JSON, a CSRF failure: no answer
         return "error", None
     items = (payload or {}).get("collection", {}).get("items", []) if isinstance(payload, dict) else []
     if not items:
@@ -627,7 +630,7 @@ def _recover_case_detail(cause: str, session, client, service_id: str, case_uuid
             log.info("case id for %s changed on TechShare; cache updated", cause)
             return client.get_case_detail(service_id, found_uuid)
         raise first_error  # listed on TechShare: a hiccup
-    if answer == "error":
+    if answer != "none":
         raise first_error
     for control in _control_causes(cause, case_uuid):
         if _lookup_cause(control, session)[0] == "found":
@@ -641,6 +644,79 @@ def _recover_case_detail(cause: str, session, client, service_id: str, case_uuid
 
 def _case_gone_line(cause: str) -> str:
     return f"CASE NOT IN YOUR TECHSHARE: TechShare has no case {cause} for this account"
+
+
+# 2026-10-19 — a cause the cache never had and the self-heal could not resolve.
+# Exit 4 has always meant "couldn't resolve it", whatever the reason: a 404
+# (TechShare lists no such case for this account), but equally a 401, a 5xx,
+# a timeout or an empty answer. The Mac needs to tell the first apart before
+# it says "TechShare doesn't list this case under your name", so `fetch`
+# prints NOT_LISTED_MARKER only when the cause-number lookup says 404, another
+# of this account's cases on the same backend answers in the same run
+# (TechShare is working), and the cause is asked about once more and is still
+# a 404 — then today's "Cannot resolve" line and exit 4 as always, so a Mac
+# without the new reader still shows its hint (Gate 2). Anything else: today's
+# exit 4, no marker.
+#
+# The marker means "not listed RIGHT NOW", not "hired private counsel": a new
+# case whose PC isn't posted yet, or whose attorney isn't attached yet, 404s
+# the same way. What keeps that safe is the Mac's rule, never this line alone:
+# a case at least 30 days old, two marks at least an hour apart, one live
+# client (all three measured 10-18: every case was listed within 3 days).
+#
+# No extra sign-in: the control lookup already proves the session works, and
+# a sign-in with a stale password would count toward a TechShare lockout. A
+# control that times out ends the asking (a slow TechShare must not hold the
+# download slot for minutes). The first lookup repeats the self-heal's
+# question from a moment earlier — one spare request, so the self-heal (which
+# process-email shares) stays exactly as it is. The marker never contains the
+# exit-5 "CASE NOT IN YOUR TECHSHARE" text (the Mac matches that elsewhere).
+NOT_LISTED_MARKER = "TECHSHARE_LISTS_NO_SUCH_CASE"
+
+
+def _not_listed_line(cause: str) -> str:
+    return f"{NOT_LISTED_MARKER}: {storage.canonical_cause(cause)}"
+
+
+def _cache_found(cause: str, case_uuid: str) -> dict | None:
+    route = _backend_for(cause)
+    if route is None:
+        return None
+    service_id, _, backend_port = route
+    entry = {"case_uuid": case_uuid, "service_id": service_id, "backend_port": backend_port}
+    storage.upsert_case_cache_entry(storage.canonical_cause(cause), entry)
+    log.info("resolved + cached %s after the self-heal missed it", cause)
+    return entry
+
+
+def _confirm_not_listed(cause: str, session) -> tuple[str, dict | None]:
+    """After the self-heal could not resolve an uncached cause: ("found",
+    cache entry) when TechShare lists it after all (cached), ("none", None)
+    when TechShare says no such case for this account while another of its
+    cases answers, ("unknown", None) for every other outcome — an empty
+    answer on the second ask included (Gate 2: kept "unknown", the safer
+    reading, like the exit-5 check)."""
+    answer, found_uuid = _lookup_cause(cause, session)
+    if answer == "found" and found_uuid:
+        entry = _cache_found(cause, found_uuid)
+        return ("found", entry) if entry else ("unknown", None)
+    if answer != "none":
+        return "unknown", None
+    for control in _control_causes(cause, None):
+        control_answer = _lookup_cause(control, session)[0]
+        if control_answer == "timeout":
+            log.warning("no-case answer for %s, but a control timed out: not confirmed", cause)
+            return "unknown", None
+        if control_answer != "found":
+            continue
+        # TechShare is answering right now: ask about the case once more.
+        again, again_uuid = _lookup_cause(cause, session)
+        if again == "found" and again_uuid:
+            entry = _cache_found(cause, again_uuid)
+            return ("found", entry) if entry else ("unknown", None)
+        return ("none", None) if again == "none" else ("unknown", None)
+    log.warning("no-case answer for %s, but no other case answered either: not confirmed", cause)
+    return "unknown", None
 
 
 def _resolve_and_cache_cause(cause: str, session) -> dict | None:
@@ -1009,6 +1085,17 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         if healed:
             service_id = service_id or healed.get("service_id")
             case_uuid = case_uuid or healed.get("case_uuid")
+
+    if (not service_id or not case_uuid) and not args.service_id and not args.case_uuid:
+        # 2026-10-19: is it TechShare saying "no such case", or trouble?
+        verdict, confirmed = _confirm_not_listed(storage.canonical_cause(cause_number), session)
+        if verdict == "found" and confirmed:
+            service_id = confirmed.get("service_id")
+            case_uuid = confirmed.get("case_uuid")
+        elif verdict == "none":
+            log.warning("fetch %s: TechShare lists no such case for this account", cause_number)
+            # Then today's line + exit 4 below (Gate 2: old Macs read it).
+            print(_not_listed_line(cause_number), file=sys.stderr)
 
     if not service_id or not case_uuid:
         log.error(
